@@ -181,7 +181,7 @@ class WindowTests(unittest.TestCase):
     def test_automation_menu_routes_enable_disable_and_refresh(self):
         choices = [0, 1, 2, 0, 3, 1, 3, 2]
         with patch.object(account, 'select', side_effect=choices), \
-                patch.object(account, 'timer_status', return_value=['Timer: active']) as status, \
+                patch.object(account, 'automation_details', return_value=['Timer: active']) as status, \
                 patch.object(account, 'schedule_control') as control:
             account.automation_menu()
         self.assertEqual(control.call_args_list, [expected_call('enable', 'windows'),

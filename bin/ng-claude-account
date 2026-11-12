@@ -22,6 +22,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1644,36 +1645,90 @@ def choose_profile(action):
     return choices[choice] if choice is not None and choice < len(choices) else None
 
 
-def edit_text(title, initial=""):
+class TextBuffer:
+    """Editable Unicode text with a cursor and optional select-all state."""
+
+    def __init__(self, text="", limit=48):
+        self.text, self.cursor, self.limit = text, len(text), limit
+        self.selected = bool(text)
+
+    def key(self, key):
+        if key in (curses.KEY_LEFT, curses.KEY_RIGHT):
+            if self.selected:
+                self.cursor = 0 if key == curses.KEY_LEFT else len(self.text)
+            else:
+                self.cursor = max(0, min(len(self.text), self.cursor + (-1 if key == curses.KEY_LEFT else 1)))
+            self.selected = False
+        elif key in (curses.KEY_HOME, "\x01", curses.KEY_END, "\x05"):
+            self.cursor = 0 if key in (curses.KEY_HOME, "\x01") else len(self.text)
+            self.selected = False
+        elif key == "\x15":
+            self.text, self.cursor, self.selected = "", 0, False
+        elif key in (curses.KEY_BACKSPACE, "\x7f", "\b", curses.KEY_DC, "\x04"):
+            if self.selected:
+                self.text, self.cursor, self.selected = "", 0, False
+            elif key in (curses.KEY_BACKSPACE, "\x7f", "\b") and self.cursor:
+                self.text = self.text[:self.cursor - 1] + self.text[self.cursor:]
+                self.cursor -= 1
+            elif key in (curses.KEY_DC, "\x04"):
+                self.text = self.text[:self.cursor] + self.text[self.cursor + 1:]
+        elif isinstance(key, str) and key.isprintable():
+            if self.selected:
+                self.text, self.cursor, self.selected = "", 0, False
+            if len(self.text) < self.limit:
+                self.text = self.text[:self.cursor] + key + self.text[self.cursor:]
+                self.cursor += len(key)
+
+
+def terminal_width(text):
+    return sum(0 if unicodedata.combining(char) else
+               2 if unicodedata.east_asian_width(char) in ("W", "F") else 1 for char in text)
+
+
+def edit_text(title, initial="", *, limit=48, validator=None, allow_empty=False):
     def draw(screen):
         screen.keypad(True)
         # get_wch raises curses.error on a timeout, unlike getch which returns -1.
         # Editing must wait indefinitely for typing, including pauses.
         screen.timeout(-1)
         curses.set_escdelay(35)
-        value = initial
+        with contextlib.suppress(curses.error):
+            curses.curs_set(1)
+        buffer = TextBuffer(initial, limit)
+        error = ""
         while True:
             screen.erase()
             height, width = screen.getmaxyx()
-            for row, line in enumerate((title, "", value,
-                                        "", "Enter: save   Esc: cancel   Backspace: delete")):
+            field_width = max(1, width - 2)
+            left = 0
+            while left < buffer.cursor and terminal_width(buffer.text[left:buffer.cursor]) >= field_width:
+                left += 1
+            for row, line in enumerate((title, "", buffer.text[left:],
+                                        error, "Enter Save   Esc Cancel   Ctrl+U Clear",
+                                        "Left/Right Move   Home/End   Delete/Backspace")):
                 if row < height - 1 and width > 1:
                     try:
                         screen.addnstr(row, 0, safe_text(line), width - 1,
-                                       curses.A_REVERSE if row == 2 else 0)
+                                       curses.A_REVERSE if row == 2 and buffer.selected else
+                                       curses.A_BOLD if row == 3 else 0)
                     except curses.error:
                         pass  # Terminal resized during drawing; redraw on KEY_RESIZE.
+            if height > 3:
+                with contextlib.suppress(curses.error):
+                    screen.move(2, min(width - 1, terminal_width(buffer.text[left:buffer.cursor])))
             screen.refresh()
             key = screen.get_wch()
             if key == "\x1b":
                 return None
             if key in ("\n", "\r", curses.KEY_ENTER):
-                if value.strip():
-                    return value.strip()
-            elif key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
-                value = value[:-1]
-            elif isinstance(key, str) and key.isprintable() and len(value) < 48:
-                value += key
+                value = buffer.text.strip()
+                error = "Enter a value." if not value and not allow_empty else ""
+                if not error and validator:
+                    error = validator(value) or ""
+                if not error:
+                    return value
+            else:
+                buffer.key(key)
     return curses.wrapper(draw)
 
 
@@ -1691,7 +1746,9 @@ def accounts_menu():
             return
         try:
             if choice == 0:
-                name = edit_text("New profile name (lowercase letters, digits, _ or -)")
+                name = edit_text("New profile name (lowercase letters, digits, _ or -)", limit=40,
+                                 validator=lambda value: None if valid_profile_name(value) else
+                                 "Start with a lowercase letter; use a-z, 0-9, _ or -.")
                 if name is None:
                     continue
                 manage_accounts("add", name)
@@ -1780,27 +1837,94 @@ def schedule_control(action, kind="windows"):
             print("Future turns are disabled; an already running turn may still finish.")
 
 
+def duration(seconds):
+    minutes = max(0, math.ceil(seconds / 60))
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    return (f"{days} d {hours} h" if days else f"{hours} h {minutes:02d} min" if hours
+            else f"{minutes} min")
+
+
+def friendly_time(timestamp):
+    if not timestamp:
+        return "Not scheduled"
+    moment = datetime.fromtimestamp(timestamp).astimezone()
+    now = datetime.now().astimezone()
+    day = (moment.date() - now.date()).days
+    label = "Today" if day == 0 else "Tomorrow" if day == 1 else moment.strftime("%a %b %d")
+    return f"{label} {moment:%H:%M} | " + (
+        "due now" if timestamp <= time.time() else "in " + duration(timestamp - time.time()))
+
+
+def systemd_timestamp(value):
+    match = re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", value or "")
+    return datetime.fromisoformat(match.group()).astimezone().timestamp() if match else None
+
+
+def automation_details(kind):
+    properties = systemctl("show", TIMERS[kind], "-p", "LoadState", "-p", "ActiveState",
+                           "-p", "UnitFileState", "-p", "NextElapseUSecRealtime")
+    values = dict(line.split("=", 1) for line in properties.splitlines() if "=" in line)
+    if values.get("LoadState") == "not-found":
+        return [TIMER_LABELS[kind], "Not installed. Run the standalone installer first."]
+    enabled = values.get("UnitFileState") in ("enabled", "enabled-runtime")
+    running = values.get("ActiveState") == "active"
+    status = ("Enabled" if enabled else "Disabled") + (" | running" if running else " | stopped")
+    service = TIMERS[kind].replace(".timer", ".service")
+    last = systemctl("show", service, "-p", "Result", "-p", "ExecMainStatus",
+                     "-p", "ExecMainStartTimestamp", "-p", "ActiveState")
+    result = dict(line.split("=", 1) for line in last.splitlines() if "=" in line)
+    if result.get("ActiveState") in ("active", "activating"):
+        outcome = "Running"
+    elif not systemd_timestamp(result.get("ExecMainStartTimestamp")):
+        outcome = "Not run yet"
+    else:
+        outcome = "Success" if result.get("Result") == "success" else "Failed (see service journal)"
+    lines = [TIMER_LABELS[kind], f"Status         {status}", f"Last result    {outcome}"]
+    if kind == "windows":
+        names = registered_profiles()
+        schedule = json.loads(prime_state_path().read_text()) if prime_state_path().exists() else {}
+        name = schedule.get("next")
+        if name not in names:
+            name = names[0] if names else None
+        lines.append("Next account   " + (display_name(name) if name else "No authenticated accounts"))
+        due = schedule.get("attempted_at", 0) + prime_interval() if schedule else None
+        lines.append("Next turn      " + (friendly_time(due) if running else "Paused"))
+        lines.append(f"Turn interval  {duration(prime_interval())} | {len(names)} account(s)")
+        if schedule.get("result"):
+            lines.append("Last turn      " + safe_text(schedule["result"]))
+        lines.append("Next turn is the account slot, not the timer's one-minute check.")
+    else:
+        next_run = systemd_timestamp(values.get("NextElapseUSecRealtime"))
+        lines.append("Next run       " + (friendly_time(next_run) if running else "Paused"))
+    return lines
+
+
 def automation_menu():
     while True:
         choice = select("Automation", [TIMER_LABELS[k] for k in TIMERS] + ["Back"])
         if choice is None or choice == len(TIMERS):
             return
         kind = list(TIMERS)[choice]
+        error = ""
         while True:
             try:
-                details = timer_status(kind)
-            except ERRORS as error:
-                select("Automation unavailable", ["Back"], [str(error)], error=True)
-                break
+                details = automation_details(kind)
+            except ERRORS as failure:
+                retry = select("Automation unavailable", ["Retry", "Back"], [str(failure)], error=True)
+                if retry != 0:
+                    break
+                continue
             action = select("Manage automation", ["Refresh status", "Enable", "Disable", "Back"],
-                            details)
+                            (["Error: " + error] if error else []) + details, error=bool(error))
             if action is None or action == 3:
                 break
             try:
                 with contextlib.redirect_stdout(io.StringIO()):
                     schedule_control(("status", "enable", "disable")[action], kind)
-            except ERRORS as error:
-                select("Action failed", ["Back"], [str(error)], error=True)
+                error = ""
+            except ERRORS as failure:
+                error = str(failure)
 
 
 MENU = (("Switch account", "switch"), ("Account details", "status"),

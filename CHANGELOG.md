@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add cursor-aware Unicode text editing with selection, inline validation, and
+  keyboard shortcuts for replacing, deleting, and clearing input.
+- Summarize automation activation, next account turn, remaining time, and service
+  results in the terminal interface instead of showing raw systemd output.
 - Extract Claude Account Switcher from its original chezmoi dotfiles distribution.
 - Provide an independent user installer; scheduled automation is opt-in.
 - Preserve the existing `ng-claude-account` command and private data layout.

@@ -155,6 +155,10 @@ rows; larger account lists are paginated instead of pushing actions off-screen.
 | `r` | Refresh usage on the dashboard |
 | `Ctrl+C` | Cancel and restore the terminal |
 
+Alias fields select their current text on entry. Type to replace it, or use
+Left/Right, Home/End, Backspace and Delete to edit in place. `Ctrl+U` clears the
+field. Validation stays inside the editor without discarding your input.
+
 Set `NO_COLOR=1` for monochrome output. Terminals with 256 colors get an eight-step
 usage gradient; basic color terminals use green, yellow, and red. Piped CLI output
 contains no color escape sequences.
