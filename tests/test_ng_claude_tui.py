@@ -52,7 +52,7 @@ def run(keys, no_color=False, small=False, compact=False, resize_to=None, expect
 
         try:
             # The help line is drawn last, so it marks a complete first frame.
-            collect_until(b'Esc')
+            collect_until(b'Esc' if small else b'q Quit')
             if resize_to:
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', *resize_to, 0, 0))
                 process.send_signal(signal.SIGWINCH)
@@ -81,21 +81,17 @@ def run(keys, no_color=False, small=False, compact=False, resize_to=None, expect
             os.close(slave)
 
 
-# Enter opens Switch; Esc returns. Down selects Account details, which reports
-# that nothing is installed; Enter returns. Down selects Renew expired tokens,
-# which has nothing to renew; Enter returns. Up twice and Enter reopen Switch;
-# choosing principal fails recoverably without credentials. Enter returns; q
-# exits. Nothing is written.
-code, output = run([b'\r', b'\x1b', b'\x1bOB', b'\r', b'\r', b'\x1bOB', b'\r', b'\r',
-                    b'\x1bOA', b'\x1bOA', b'\r', b'\r', b'\r', b'q'])
+# Enter opens the selected account directly. Switching a pending profile reports
+# an inline error; Esc returns to the dashboard, where it remains visible.
+code, output = run([b'\r', b'\r', b'\x1b', b'q'])
 assert code == 0, output
-assert b'Choose an account to switch' in output, output
+assert b'Account actions' in output, output
 assert b'No Claude credentials yet' in output, output
-assert b'Action failed' in output, output
+assert b'Error:' in output, output
 assert b'5;173m' in output, 'Missing terracotta color sequences'
 assert b'A C C O U N T   S W I T C H E R' in output
-assert b'ACCOUNTS' in output and b'-- Manage --' in output
-assert b'not registered' in output and b'r Refresh usage' in output
+assert b'ACCOUNTS' in output and b'Manage accounts' in output
+assert b'not registered' in output and b'r Refresh' in output
 code, output = run([b'q'], no_color=True)
 assert code == 0
 assert b'5;173m' not in output
@@ -108,9 +104,14 @@ code, output = run([b'\x1b'], small=True)
 assert code == 0 and b'Enlarge terminal' in output
 code, output = run([b'\x03'])
 assert code == 130 and b'Cancelled' in output
-code, output = run([b'\x1bOB'] * 4 + [b'\r', b'\r', 1.0, b' test', b'\x1b', b'q'])
+code, output = run([b'\r', b'\x1bOB', b'\x1bOB', b'\r', 1.0, b' test', b'\x1b', b'\x1b', b'q'])
 assert code == 0 and b'Alias for principal' in output, (code, output[-400:])
-code, output = run([b'\x1bOB'] * 4 + [b'\r', b'\r', 1.0, b'\x7f' * 9, b'Personal',
-                                    1.0, b'\r', b'\r', b'q'], expected_alias='Personal')
-assert code == 0 and b'Updated profile:' in output, (code, output[-400:])
+code, output = run([b'\r', b'\x1bOB', b'\x1bOB', b'\r', 1.0, b'\x7f' * 9, b'Personal',
+                    1.0, b'\r', b'q'], expected_alias='Personal')
+assert code == 0 and b'Alias saved:' in output, (code, output[-400:])
+code, output = run([b'/', b'secundaria', b'\r', b'\x1b', b'q'])
+assert code == 0 and b'Search accounts' in output, (code, output[-400:])
+code, output = run([b'\r', b'\x1bOB', b'\x1bOB', b'\r', b'Wrok', b'\x1bOH', b'\x1bOC',
+                    b'\x1b[3~', b'\x1bOC', b'r', b'\r', b'q'], expected_alias='Work')
+assert code == 0, (code, output[-400:])
 print('PASS: PTY navigation, terracotta, ASCII logo, active card, groups, compact mode, live resizing, NO_COLOR, errors, idle alias editing, save/cancel and terminal restoration')

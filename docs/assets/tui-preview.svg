@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="960" height="820" viewBox="0 0 960 820" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="740" viewBox="0 0 960 740" role="img" aria-labelledby="title desc">
   <title id="title">Claude Account Switcher terminal interface</title>
-  <desc id="desc">Illustration with two fictional accounts, five-hour and weekly usage bars, an active account marker, and the keyboard-driven action menu.</desc>
+  <desc id="desc">Illustration with directly selectable accounts, separate token and quota states, five-hour and weekly usage bars, search shortcuts and a brief success notification.</desc>
   <defs>
     <linearGradient id="usage" x1="0" x2="1">
       <stop offset="0" stop-color="#5fd75f"/>
@@ -24,7 +24,7 @@
       .selected { fill: #151515; font-weight: bold; }
     </style>
   </defs>
-  <rect width="960" height="820" rx="12" fill="#151515"/>
+  <rect width="960" height="740" rx="12" fill="#151515"/>
   <rect width="960" height="38" rx="12" fill="#242424"/>
   <rect y="25" width="960" height="13" fill="#242424"/>
   <circle cx="22" cy="19" r="5" fill="#e87973"/>
@@ -40,43 +40,41 @@
   </g>
   <text x="87" y="177" font-weight="bold">A C C O U N T   S W I T C H E R</text>
   <text x="365" y="198" class="accent small">ng</text>
-  <rect x="38" y="220" width="884" height="200" rx="8" fill="none" stroke="#555550"/>
-  <rect x="51" y="210" width="119" height="20" fill="#151515"/>
-  <text x="60" y="225" class="muted small">ACCOUNTS</text>
-  <text x="60" y="252" class="active">● Personal   personal@example.test</text>
-  <text x="827" y="252" class="active small">ACTIVE</text>
-  <text x="79" y="280" class="muted small">5 h</text>
-  <rect x="135" y="269" width="420" height="13" fill="url(#usage)"/>
-  <rect x="185.4" y="269" width="369.6" height="13" fill="#353631"/>
-  <text x="576" y="281" class="active small">12 %</text>
-  <text x="651" y="281" class="muted small">resets 14:30</text>
-  <text x="79" y="307" class="muted small">7 d</text>
-  <rect x="135" y="296" width="420" height="13" fill="url(#usage)"/>
-  <rect x="273.6" y="296" width="281.4" height="13" fill="#353631"/>
-  <text x="576" y="308" class="lime small">33 %</text>
-  <text x="651" y="308" class="muted small">resets Fri 09:00</text>
-  <text x="60" y="350">○ Work       work@example.test</text>
-  <text x="79" y="378" class="muted small">5 h</text>
-  <rect x="135" y="367" width="420" height="13" fill="url(#usage)"/>
-  <rect x="420.6" y="367" width="134.4" height="13" fill="#353631"/>
-  <text x="576" y="379" class="orange small">68 %</text>
-  <text x="651" y="379" class="muted small">resets 17:00</text>
-  <text x="79" y="405" class="muted small">7 d</text>
-  <rect x="135" y="394" width="420" height="13" fill="url(#usage)"/>
-  <rect x="525.6" y="394" width="29.4" height="13" fill="#353631"/>
-  <text x="576" y="406" class="red small">93 %</text>
-  <text x="651" y="406" class="muted small">resets Sun 09:00</text>
-  <rect x="38" y="448" width="884" height="28" rx="3" fill="#d89170"/>
-  <text x="59" y="467" class="selected">&gt; Switch account</text>
-  <text x="79" y="495">Account details</text>
-  <text x="79" y="523">Renew expired tokens</text>
-  <text x="79" y="551">Log in / re-authenticate</text>
-  <text x="59" y="591" class="muted">-- Manage --</text>
-  <text x="79" y="619">Edit alias</text>
-  <text x="79" y="647">Diagnose authentication</text>
-  <text x="79" y="675">Restore an account</text>
-  <text x="79" y="703">Manage accounts</text>
-  <text x="79" y="731">Automation</text>
-  <text x="79" y="767">Exit</text>
-  <text x="38" y="800" class="muted small">↑/↓ Move    Enter Select    r Refresh usage    Esc Back</text>
+  <rect x="38" y="220" width="884" height="260" rx="8" fill="none" stroke="#555550"/>
+  <rect x="51" y="210" width="154" height="20" fill="#151515"/>
+  <text x="60" y="225" class="muted small">ACCOUNTS 2/2</text>
+  <rect x="52" y="234" width="856" height="27" rx="2" fill="#d89170"/>
+  <text x="60" y="253" class="selected">&gt; ● Personal   personal@example.test</text>
+  <text x="834" y="253" class="selected small">Active</text>
+  <text x="60" y="276" class="muted small">Token: valid until 14:30 (120 min) | Quota: Live reading</text>
+  <text x="79" y="302" class="muted small">5 h</text>
+  <rect x="135" y="291" width="420" height="13" fill="url(#usage)"/>
+  <rect x="185.4" y="291" width="369.6" height="13" fill="#353631"/>
+  <text x="576" y="303" class="active small">12 %</text>
+  <text x="651" y="303" class="muted small">resets 14:30</text>
+  <text x="79" y="329" class="muted small">7 d</text>
+  <rect x="135" y="318" width="420" height="13" fill="url(#usage)"/>
+  <rect x="273.6" y="318" width="281.4" height="13" fill="#353631"/>
+  <text x="576" y="330" class="lime small">33 %</text>
+  <text x="651" y="330" class="muted small">resets Fri 09:00</text>
+  <text x="60" y="374">  ○ Work       work@example.test</text>
+  <text x="841" y="374" class="muted small">Saved</text>
+  <text x="60" y="398" class="muted small">Token: expired | Quota: Cached 14:55 | 5 min old</text>
+  <text x="79" y="424" class="muted small">5 h</text>
+  <rect x="135" y="413" width="420" height="13" fill="url(#usage)"/>
+  <rect x="420.6" y="413" width="134.4" height="13" fill="#353631"/>
+  <text x="576" y="425" class="orange small">68 %</text>
+  <text x="651" y="425" class="muted small">resets 17:00</text>
+  <text x="79" y="451" class="muted small">7 d</text>
+  <rect x="135" y="440" width="420" height="13" fill="url(#usage)"/>
+  <rect x="525.6" y="440" width="29.4" height="13" fill="#353631"/>
+  <text x="576" y="452" class="red small">93 %</text>
+  <text x="651" y="452" class="muted small">resets Sun 09:00</text>
+  <text x="79" y="520">Manage accounts</text>
+  <text x="79" y="548">Renew all tokens</text>
+  <text x="79" y="576">Automation</text>
+  <text x="79" y="604">Diagnostics</text>
+  <text x="79" y="632">Exit</text>
+  <text x="38" y="682" class="active small">Alias saved: Work.</text>
+  <text x="38" y="718" class="muted small">↑/↓ Select   Enter Actions   / Search   r Refresh   q Quit</text>
 </svg>

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Make accounts directly selectable on the dashboard, with contextual switching,
+  details, alias editing, renewal, login, restoration, and profile removal.
+- Add case-insensitive account search, clear authentication/quota states, and
+  short success notifications without acknowledgement screens.
 - Add cursor-aware Unicode text editing with selection, inline validation, and
   keyboard shortcuts for replacing, deleting, and clearing input.
 - Summarize automation activation, next account turn, remaining time, and service

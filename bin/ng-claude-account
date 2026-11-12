@@ -1204,7 +1204,8 @@ def profile_usage(name, force=False):
         return cached_result(cache, "rate limited", cache["retry_at"])
     if (not force and cache["windows"]
             and time.time() - cache["fetched_at"] < USAGE_FRESH_SECONDS):
-        return {"state": "ok", "windows": cache["windows"]}
+        return {"state": "ok", "windows": cache["windows"],
+                "fetched_at": cache["fetched_at"], "cache_hit": True}
     try:
         current = active()
     except ERRORS:
@@ -1235,8 +1236,9 @@ def profile_usage(name, force=False):
                 except ERRORS:
                     return {"state": "token renewal failed - retry or log in again"}
         windows = fetch_usage(data["claudeAiOauth"]["accessToken"])
-        write_usage_cache(name, windows, time.time())
-        return {"state": "ok", "windows": windows}
+        fetched_at = time.time()
+        write_usage_cache(name, windows, fetched_at)
+        return {"state": "ok", "windows": windows, "fetched_at": fetched_at}
     except UsageUnavailable as error:
         if error.retry_after:
             retry_at = time.time() + error.retry_after
@@ -1357,10 +1359,52 @@ def account_overview():
             info = identity(name)
         except ERRORS:
             info = {}
+        state, token, session = "Saved", "unavailable", "unknown"
+        try:
+            data = load(LIVE if name == current else credential_path(name))
+            token, session = token_summary(data), session_summary(data)
+            days = session_days(data)
+            state = "Login required" if days is not None and days <= 0 else (
+                "Active" if name == current else "Saved")
+        except FileNotFoundError:
+            state = "Not registered"
+        except ERRORS:
+            state = "Needs attention"
+        if name == current and problem:
+            state = "Needs attention"
         rows.append({"name": name, "alias": safe_text(info.get("alias", name)),
                      "email": safe_text(info.get("email", "identity pending")),
-                     "active": name == current})
+                     "active": name == current, "state": state,
+                     "token": token, "session": session})
     return rows, problem
+
+
+def filter_accounts(accounts, query):
+    query = query.strip().casefold()
+    return [row for row in accounts if not query or any(
+        query in str(row.get(key, "")).casefold() for key in ("name", "alias", "email"))]
+
+
+def ui_account_state(row, result):
+    reason = result.get("state", "") if result else ""
+    if "token rejected" in reason:
+        return "Login required"
+    if "renewal failed" in reason or "credentials unavailable" in reason:
+        return "Needs attention"
+    return row.get("state", "Active" if row["active"] else "Saved")
+
+
+def quota_status(result, loading=False):
+    cached_at = (result.get("cached_at") or (result.get("fetched_at") if result.get("cache_hit") else None)) if result else None
+    if cached_at:
+        age = max(0, time.time() - cached_at)
+        text = f"Cached {clock(cached_at)} | " + ("just now" if age < 60 else duration(age - age % 60) + " old")
+        return text + (f" | retry {clock(result['retry_at'])}" if result.get("retry_at") else "")
+    if result and result.get("state") == "ok":
+        return "Updating..." if loading else "Live reading"
+    if loading or result is None:
+        return "Loading..."
+    return result["state"]
 
 
 SIGNATURE = "ng"
@@ -1378,7 +1422,7 @@ BOX = ({"tl": "\u256d", "tr": "\u256e", "bl": "\u2570", "br": "\u256f", "h": "\u
 
 
 def select(title, options, details=(), initial=0, error=False, dashboard=False, usage=None,
-           groups=None):
+           groups=None, focus=None, query="", notice_until=None, notice_error=False):
     """Return an option index, restoring terminal state even on cancellation."""
     def draw(screen):
         screen.keypad(True)
@@ -1429,8 +1473,12 @@ def select(title, options, details=(), initial=0, error=False, dashboard=False, 
         screen.timeout(250 if usage is not None else -1)
 
         selected = min(initial, len(options) - 1)
+        initialized = False
+        total = len(options)
         account_page = 0
         account_pages = 1
+        capacity = 1
+        accounts = []
         while True:
             screen.erase()
             height, width = screen.getmaxyx()
@@ -1462,9 +1510,21 @@ def select(title, options, details=(), initial=0, error=False, dashboard=False, 
                 grouped = False
                 if dashboard:
                     accounts, problem = account_overview()
-                    full = height >= max(32, len(options) + len(groups or {}) + 13
-                                         + 4 * len(accounts)) and width >= 60
-                    grouped = full or height >= len(options) + len(accounts) + 9
+                    all_count = len(accounts)
+                    accounts = filter_accounts(accounts, query)
+                    total = len(accounts) + len(options)
+                    if not initialized:
+                        if focus and focus[0] == "account":
+                            selected = next((i for i, row in enumerate(accounts)
+                                             if row["name"] == focus[1]), 0)
+                        elif focus and focus[0] == "action":
+                            selected = len(accounts) + min(focus[1], len(options) - 1)
+                        else:
+                            selected = next((i for i, row in enumerate(accounts) if row["active"]), 0)
+                        initialized = True
+                    selected = max(0, min(selected, total - 1))
+                    full = height >= max(26, len(options) + 13 + 5 * len(accounts)) and width >= 60
+                    grouped = False
                     results, loading = usage.snapshot() if usage else ({}, False)
                     if full:
                         for row, line in enumerate(LOGO, 1):
@@ -1475,27 +1535,37 @@ def select(title, options, details=(), initial=0, error=False, dashboard=False, 
                         put(8, SIGNATURE, accent, x=2 + len(subtitle) - len(SIGNATURE))
                         card = min(width - 4, 72)
                         inner = card - 4
-                        label = " ACCOUNTS " + ("- " + problem + " " if problem else "")
+                        label = f" ACCOUNTS {len(accounts)}/{all_count} "
+                        if query:
+                            label += f"/ {query[:16]} "
+                        label += ("- " + problem + " " if problem else "")
                         label += "- loading usage " if loading else ""
+                        label = label[:card - 3]
                         put(9, BOX["tl"] + BOX["h"] + label + BOX["h"] * (card - len(label) - 3)
                             + BOX["tr"], muted)
                         row = 10
+                        if not accounts:
+                            put(row, "No accounts match. / Search or Esc to clear.", muted, x=4)
+                            row += 1
                         for index, account in enumerate(accounts):
                             if index:
                                 put(row, BOX["v"] + " " * (card - 2) + BOX["v"], muted)
                                 row += 1
                             mark = GLYPHS["active"] if account["active"] else GLYPHS["idle"]
                             result = results.get(account["name"])
-                            note = usage_note(result) if result else ""
-                            tag = "  ".join(filter(None, [note, "ACTIVE" if account["active"] else ""]))
-                            head = f"{mark} {account['alias']}   {account['email']}"
+                            is_selected = selected == index
+                            state = ui_account_state(account, result)
+                            tag = state
+                            head = f"{'>' if is_selected else ' '} {mark} {account['alias']}   {account['email']}"
                             head = head[:max(0, inner - len(tag) - 1)].ljust(inner - len(tag))
                             put(row, BOX["v"] + " " + " " * inner + " " + BOX["v"], muted)
-                            put(row, head, active_style if account["active"] else curses.A_BOLD, x=4)
-                            if note:
-                                put(row, note, muted, x=4 + inner - len(tag))
-                            if account["active"]:
-                                put(row, "ACTIVE", active_style, x=4 + inner - 6)
+                            style = highlight if is_selected else active_style if account["active"] else curses.A_BOLD
+                            put(row, head + tag, style, x=4)
+                            row += 1
+                            token_line = (f"Token: {account.get('token', 'unknown')} | "
+                                          f"Quota: {quota_status(result, loading)}")[:inner]
+                            put(row, BOX["v"] + " " * (card - 2) + BOX["v"], muted)
+                            put(row, token_line, muted, x=4)
                             row += 1
                             windows = result.get("windows", {}) if result else {}
                             for line_index, (key, short) in enumerate(USAGE_WINDOWS):
@@ -1525,21 +1595,31 @@ def select(title, options, details=(), initial=0, error=False, dashboard=False, 
                         put_header()
                         row = 3
                         bar_width = max(4, (width - 4 - 34) // 2)
-                        capacity = max(1, height - len(options) - 6)
+                        capacity = max(1, (height - len(options) - 7) // 3)
                         account_pages = max(1, math.ceil(len(accounts) / capacity))
+                        if selected < len(accounts):
+                            account_page = selected // capacity
                         account_page %= account_pages
                         first = account_page * capacity
                         visible_accounts = accounts[first:first + capacity]
-                        if account_pages > 1:
-                            put(2, f"Accounts {first + 1}-{first + len(visible_accounts)}/{len(accounts)}"
-                                "  [ / ] pages", muted)
-                        for account in visible_accounts:
+                        heading = (f"Accounts {first + 1 if accounts else 0}-{first + len(visible_accounts)}"
+                                   f"/{len(accounts)}" + (f"  / {query}" if query else ""))
+                        put(2, heading, muted)
+                        if not accounts:
+                            put(row, "No accounts match. / Search or Esc to clear.", muted)
+                            row += 1
+                        for index, account in enumerate(visible_accounts, first):
                             mark = GLYPHS["active"] if account["active"] else GLYPHS["idle"]
-                            put(row, f"{mark} {account['alias'][:10]}",
-                                active_style if account["active"] else curses.A_BOLD)
                             result = results.get(account["name"])
+                            state = ui_account_state(account, result)
+                            tag = f"[{state}]"
+                            body = f"{'>' if selected == index else ' '} {mark} {account['alias']} | {account['email']}"
+                            text = body[:max(0, width - 5 - len(tag))].ljust(width - 4 - len(tag)) + tag
+                            put(row, text.ljust(width - 4), highlight if selected == index else
+                                active_style if account["active"] else curses.A_BOLD)
+                            row += 1
                             windows = result.get("windows", {}) if result else {}
-                            x = 15
+                            x = 4
                             if windows:
                                 for key, short in USAGE_WINDOWS:
                                     window = windows.get(key)
@@ -1554,6 +1634,9 @@ def select(title, options, details=(), initial=0, error=False, dashboard=False, 
                             else:
                                 message = "loading..." if loading or result is None else result["state"]
                                 put(row, message, muted, x=x)
+                            row += 1
+                            put(row, (f"Token: {account.get('token', 'unknown')} | "
+                                      f"Quota: {quota_status(result, loading)}"), muted)
                             row += 1
                         start = row + 1
                 else:
@@ -1580,16 +1663,18 @@ def select(title, options, details=(), initial=0, error=False, dashboard=False, 
                     if grouped and groups and index in groups:
                         put(start + index + offset, groups[index], muted)
                         offset += 1
-                    marker = "> " if index == selected else "  "
+                    is_selected = selected == index + (len(accounts) if dashboard else 0)
+                    marker = "> " if is_selected else "  "
                     put(start + index - begin + offset, (marker + label).ljust(width - 4),
-                        highlight if index == selected else 0)
+                        highlight if is_selected else 0)
                 last_row = start + end - begin - 1 + offset
-                if dashboard and details and last_row < height - 3:
+                if (dashboard and details and last_row < height - 3
+                        and (notice_until is None or time.monotonic() < notice_until)):
                     # Sync notices (for example, an adopted renewal) above the help line.
-                    put(height - 3, safe_text(details[0]), accent if problem else muted)
-                if usage is not None:
-                    help_text = ("Up/Down Move   Enter Select   r Refresh usage   Esc Back"
-                                 if width >= 62 else "Up/Down  Enter  r Refresh  Esc")
+                    put(height - 3, safe_text(details[0]), accent if notice_error or problem else active_style)
+                if dashboard:
+                    help_text = ("Up/Down Select  Enter Actions  / Search  r Refresh  q Quit"
+                                 if width >= 65 else "Up/Down  Enter  / Search  r Refresh  q Quit")
                 else:
                     help_text = ("Up/Down Move   Enter Select   Esc Back"
                                  if width >= 50 else "Up/Down  Enter  Esc")
@@ -1600,28 +1685,38 @@ def select(title, options, details=(), initial=0, error=False, dashboard=False, 
                 continue
             if dashboard and key in (ord("["), ord("]")):
                 account_page = (account_page + (1 if key == ord("]") else -1)) % account_pages
+                if accounts:
+                    selected = min(len(accounts) - 1, account_page * capacity)
                 continue
+            if dashboard and key == ord("/"):
+                return ("search", ("account", accounts[selected]["name"]) if selected < len(accounts)
+                        else ("action", selected - len(accounts)))
             if usage is not None and key == ord("r"):
                 usage.start(force=True)
                 continue
             if key in (27, ord("q")):
+                if dashboard and key == 27 and query:
+                    return ("clear-search", None)
                 return None
             if key == 3:
                 raise KeyboardInterrupt
             if key in (curses.KEY_UP, ord("k"), curses.KEY_BTAB):
-                selected = (selected - 1) % len(options)
+                selected = (selected - 1) % total
             elif key in (curses.KEY_DOWN, ord("j"), 9):
-                selected = (selected + 1) % len(options)
+                selected = (selected + 1) % total
             elif key == curses.KEY_HOME:
                 selected = 0
             elif key == curses.KEY_END:
-                selected = len(options) - 1
+                selected = total - 1
             elif key == curses.KEY_NPAGE:
-                selected = min(len(options) - 1, selected + max(1, height // 2))
+                selected = min(total - 1, selected + max(1, height // 2))
             elif key == curses.KEY_PPAGE:
                 selected = max(0, selected - max(1, height // 2))
             elif key in (10, 13, curses.KEY_ENTER):
                 if height >= minimum_height and width >= 36:
+                    if dashboard:
+                        return (("account", accounts[selected]["name"]) if selected < len(accounts)
+                                else ("action", selected - len(accounts)))
                     return selected
 
     return curses.wrapper(draw)
@@ -1736,12 +1831,96 @@ def edit_alias(profile):
     return edit_text(f"Alias for {profile}", identity(profile).get("alias", profile))
 
 
+def renew_profile(name):
+    with tool_lock():
+        state = sync()
+        if state["status"] != "ok":
+            raise ValueError("Reconcile the live credentials before renewing an account.")
+        if name == state["active"]:
+            renew(state)
+        else:
+            data = freshen(credential_path(name))
+            print(f"Token for {display_name(name)}: {token_summary(data)}")
+
+
+def account_details(name, usage):
+    rows, _ = account_overview()
+    row = next((item for item in rows if item["name"] == name), None)
+    if row is None:
+        return ["This profile has been removed."]
+    results, loading = usage.snapshot()
+    result = results.get(name)
+    lines = [profile_label(name), f"Account: {ui_account_state(row, result)}",
+             f"Access token: {row.get('token', 'unknown')}",
+             f"Login session: {row.get('session', 'unknown')}",
+             "Quota: " + quota_status(result, loading)]
+    for key, label in USAGE_WINDOWS:
+        window = result.get("windows", {}).get(key) if result else None
+        if window:
+            lines.append(f"{label} quota used: {window['used']:.1f}% | {format_reset(window['resets'])}")
+    return lines
+
+
+def account_actions(name, usage):
+    labels = ["Switch to this account", "Account details", "Rename alias", "Renew token",
+              "Log in / re-authenticate", "Restore credentials", "Remove profile", "Back"]
+    selected, error = 0, ""
+    while name in profiles():
+        choice = select("Account actions", labels,
+                        (["Error: " + error] if error else []) + account_details(name, usage),
+                        initial=selected, error=bool(error))
+        if choice is None or choice == 7:
+            return (error, True) if error else None
+        selected = choice
+        try:
+            if choice == 1:
+                select("Account details", ["Back"], account_details(name, usage))
+                continue
+            if choice == 2:
+                alias = edit_alias(name)
+                if alias is None:
+                    continue
+                with contextlib.redirect_stdout(io.StringIO()):
+                    execute("alias", name, alias)
+                return (f"Alias saved: {alias}.", False)
+            if choice in (5, 6):
+                label = "Restore credentials" if choice == 5 else "Remove profile"
+                if select(label + "?", ["Cancel", label], [profile_label(name),
+                          "Existing credentials are preserved in their profile or a private archive."]) != 1:
+                    continue
+            if choice == 4:
+                execute("login", name)  # Browser login needs the restored normal terminal.
+            else:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    if choice == 0:
+                        execute("switch", name)
+                    elif choice == 3:
+                        renew_profile(name)
+                    elif choice == 5:
+                        execute("repair", name)
+                    elif choice == 6:
+                        manage_accounts("remove", name)
+            usage.start(force=True)
+            message = {0: f"Selected {display_name(name)}. OpenCode may take about 30 s to update.",
+                       3: f"Token checked for {display_name(name)}.",
+                       4: f"Login saved for {display_name(name)}.",
+                       5: f"Credentials restored for {display_name(name)}.",
+                       6: f"Removed {name}; credentials archived privately."}[choice]
+            return (message, False)
+        except ERRORS as failure:
+            error = str(failure)
+    return None
+
+
 def accounts_menu():
+    error = ""
     while True:
         choice = select("Manage accounts", ["Add account", "Remove account",
                                            "Register current credentials", "Back"],
+                        (["Error: " + error] if error else []) +
                         [f"{len(registered_profiles())} authenticated account(s)",
-                         f"Window turn interval: {prime_interval() / 60:g} min (5 h / N)"])
+                         f"Window turn interval: {prime_interval() / 60:g} min (5 h / N)"],
+                        error=bool(error))
         if choice is None or choice == 3:
             return
         try:
@@ -1752,7 +1931,7 @@ def accounts_menu():
                 if name is None:
                     continue
                 manage_accounts("add", name)
-                select("Account added", ["Back"], [profile_label(name)])
+                return f"Added {profile_label(name)}."
             elif choice == 1:
                 name = choose_profile("remove")
                 if name is None:
@@ -1763,14 +1942,14 @@ def accounts_menu():
                 output = io.StringIO()
                 with contextlib.redirect_stdout(output):
                     manage_accounts("remove", name)
-                select("Account removed", ["Back"], output.getvalue().splitlines())
+                return f"Removed {name}; credentials archived privately."
             else:
                 output = io.StringIO()
                 with contextlib.redirect_stdout(output):
                     execute("init")
-                select("Current credentials", ["Back"], output.getvalue().splitlines())
-        except ERRORS as error:
-            select("Action failed", ["Back"], [str(error)], error=True)
+                return "Current credentials registered."
+        except ERRORS as failure:
+            error = str(failure)
 
 
 TIMERS = {"windows": "ng-claude-account-window.timer",
@@ -1927,12 +2106,9 @@ def automation_menu():
                 error = str(failure)
 
 
-MENU = (("Switch account", "switch"), ("Account details", "status"),
-        ("Renew expired tokens", "renew-all"), ("Log in / re-authenticate", "login"),
-        ("Edit alias", "alias"), ("Diagnose authentication", "doctor"),
-        ("Restore an account", "repair"), ("Manage accounts", "accounts-menu"),
-        ("Automation", "automation"), ("Exit", None))
-MENU_GROUPS = {4: "-- Manage --", 9: ""}
+MENU = (("Manage accounts", "accounts-menu"), ("Renew all tokens", "renew-all"),
+        ("Automation", "automation"), ("Diagnostics", "doctor"), ("Exit", None))
+MENU_GROUPS = {}
 
 
 def startup_sync():
@@ -1947,62 +2123,64 @@ def startup_sync():
 
 
 def menu():
-    selected = 0
     options = [label for label, _ in MENU]
     notices = startup_sync()
+    notice_until, notice_error = None, bool(notices and LAST_SYNC["status"] not in ("ok", "unsynced"))
+    focus, query = None, ""
     usage = UsageMonitor()
     usage.start()
     while True:
-        choice = select("Your accounts", options, notices, initial=selected, dashboard=True,
-                        usage=usage, groups=MENU_GROUPS)
-        if choice is None or MENU[choice][1] is None:
+        choice = select("Your accounts", options, notices, dashboard=True,
+                        usage=usage, groups=MENU_GROUPS, focus=focus, query=query,
+                        notice_until=notice_until, notice_error=notice_error)
+        if choice is None:
             return
-        selected = choice
+        kind, value = choice
+        if kind == "search":
+            focus = value
+            result = edit_text("Search accounts (alias, name or email)", query,
+                               limit=100, allow_empty=True)
+            if result is not None:
+                query = result
+            continue
+        if kind == "clear-search":
+            query = ""
+            continue
+        focus = choice
         try:
-            command = MENU[choice][1]
+            if kind == "account":
+                result = account_actions(value, usage)
+                if result:
+                    message, notice_error = result
+                    notices = [message]
+                    notice_until = None if notice_error else time.monotonic() + 6
+                continue
+            command = MENU[value][1]
+            if command is None:
+                return
             if command == "automation":
                 automation_menu()
                 continue
             if command == "accounts-menu":
-                accounts_menu()
+                result = accounts_menu()
+                if result:
+                    notices, notice_error, notice_until = [result], False, time.monotonic() + 6
                 usage.start(force=True)
                 continue
-            profile = None
-            alias = None
-            if command in ("switch", "login", "repair", "alias"):
-                profile = choose_profile(command)
-                if profile is None:
-                    continue
-            if command == "alias":
-                alias = edit_alias(profile)
-                if alias is None:
-                    continue
-            if command == "repair":
-                confirm = select("Restore this account into ~/.claude?", ["Cancel", "Restore"],
-                                 [profile_label(profile),
-                                  "What ~/.claude holds now is saved to its own profile when it "
-                                  "belongs to it, or to a private backup otherwise."])
-                if confirm != 1:
-                    continue
-            if command == "login":
-                # The selector has restored the terminal for Claude's browser login.
-                execute(command, profile)
-                message = f"Authentication saved for {profile_label(profile)}."
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result = execute(command)
+            if command == "doctor":
+                select("Credential diagnostics", ["Back"], output.getvalue().splitlines(),
+                       error=result is False)
             else:
-                output = io.StringIO()
-                with contextlib.redirect_stdout(output):
-                    execute(command, profile, alias)
-                message = output.getvalue()
-            if command in ("switch", "login", "renew", "renew-all", "repair", "init"):
-                usage.start(force=True)  # Accounts or tokens may have changed.
-            select("Account status" if command == "status" else "Done", ["Back to menu"],
-                   message.splitlines())
-        except ERRORS as error:
-            select("Action failed", ["Back to menu"], [str(error)], error=True)
-        finally:
-            # Only an unresolved credential problem stays on the dashboard.
-            notices = (LAST_SYNC["notes"][-1:]
-                       if LAST_SYNC["status"] not in ("ok", "unsynced") else [])
+                notice_error = result is False
+                notices = (["Some accounts need attention. Open Account actions to renew or log in."]
+                           if notice_error else ["Tokens checked for all accounts."])
+                notice_until = None if notice_error else time.monotonic() + 6
+                usage.start(force=True)
+        except ERRORS as failure:
+            notices, notice_error, notice_until = [str(failure)], True, None
 
 
 def main():

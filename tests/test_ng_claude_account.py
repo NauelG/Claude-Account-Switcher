@@ -67,7 +67,7 @@ OVERVIEW = ([{'name': 'principal', 'alias': 'Personal', 'email': 'a@example.test
             None)
 
 
-def render(height, width, usage=None, keys=None, details=(), overview=OVERVIEW):
+def render(height, width, usage=None, keys=None, details=(), overview=OVERVIEW, **kwargs):
     screen = FakeScreen(height, width)
     screen.keys = list(keys or [])
     with patch.object(account.curses, 'wrapper', side_effect=lambda draw: draw(screen)), \
@@ -75,8 +75,8 @@ def render(height, width, usage=None, keys=None, details=(), overview=OVERVIEW):
          patch.object(account.curses, 'curs_set'), \
          patch.object(account.curses, 'has_colors', return_value=False), \
          patch.object(account, 'account_overview', return_value=overview):
-        account.select('Your accounts', [label for label, _ in account.MENU], details,
-                       dashboard=True, usage=usage, groups=account.MENU_GROUPS)
+        screen.choice = account.select('Your accounts', [label for label, _ in account.MENU], details,
+                                      dashboard=True, usage=usage, groups=account.MENU_GROUPS, **kwargs)
     return screen
 
 full = render(33, 100)
@@ -89,16 +89,16 @@ compact = render(18, 48)
 assert compact.row(1).strip() == 'CLAUDE ACCOUNT SWITCHER  ng', compact.row(1)
 # Every menu entry fits at the minimum full-layout size, with its group headings.
 menu_text = '\n'.join(full.row(y) for y in range(33))
-assert all(label in menu_text for label, _ in account.MENU) and '-- Manage --' in menu_text
-assert 'Renew expired tokens' in menu_text
-help_row = next(y for y in range(33) if 'Esc Back' in full.row(y))
+assert all(label in menu_text for label, _ in account.MENU)
+assert 'Renew all tokens' in menu_text
+help_row = next(y for y in range(33) if 'q Quit' in full.row(y))
 exit_row = next(y for y in range(33) if full.row(y).strip() == 'Exit')
 assert exit_row < help_row
 # Sync notices appear above the help line when there is room, and never overlap items.
 notice = 'Saved the token renewed outside this tool for Work.'
 roomy = render(34, 100, details=[notice])
 rows = [roomy.row(y) for y in range(34)]
-assert notice in rows[34 - 3] and 'Esc Back' in rows[34 - 2]
+assert notice in rows[34 - 3] and 'q Quit' in rows[34 - 2]
 assert not any(notice in row for row in [render(32, 100, details=[notice]).row(y) for y in range(28)])
 # Unresolved credential problems are named in the card header.
 troubled = render(34, 100, overview=(OVERVIEW[0], 'unregistered account in ~/.claude'))
@@ -115,6 +115,28 @@ assert all(label in page_text for label, _ in account.MENU), 'Account pages must
 tall = render(40, 100, overview=(many[:3], None))
 tall_text = '\n'.join(tall.row(y) for y in range(40))
 assert 'A C C O U N T' in tall_text and all(f'Account{i}' in tall_text for i in range(3))
+
+# Account focus is independent of which account is active. Enter acts on that
+# account directly, while a query filters by name, alias or email.
+focused = render(34, 100, keys=[account.curses.KEY_DOWN, 10])
+assert focused.choice == ('account', 'secundaria')
+filtered = render(34, 100, query='B@EXAMPLE.TEST', keys=[10])
+assert filtered.choice == ('account', 'secundaria')
+assert 'Personal' not in '\n'.join(filtered.row(y) for y in range(34))
+missing = render(34, 100, query='no-such-account', keys=[10])
+assert missing.choice == ('action', 0)
+assert 'No accounts match' in '\n'.join(missing.row(y) for y in range(34))
+cleared = render(34, 100, query='work', keys=[27])
+assert cleared.choice == ('clear-search', None)
+search = render(34, 100, focus=('account', 'secundaria'), keys=[ord('/')])
+assert search.choice == ('search', ('account', 'secundaria'))
+with patch.object(account.time, 'monotonic', return_value=100):
+    expired = render(34, 100, details=['Toast example'], notice_until=99)
+    shown = render(34, 100, details=['Toast example'], notice_until=101)
+    sticky = render(34, 100, details=['Persistent error'], notice_error=True)
+assert 'Toast example' not in '\n'.join(expired.row(y) for y in range(34))
+assert 'Toast example' in '\n'.join(shown.row(y) for y in range(34))
+assert 'Persistent error' in '\n'.join(sticky.row(y) for y in range(34))
 
 # Profile pickers scroll their options rather than requiring an N-row terminal.
 picker = FakeScreen(12, 60)
@@ -333,9 +355,9 @@ screen = render(33, 100, usage=stub, keys=[-1, ord('r'), 27])
 text = '\n'.join(screen.row(y) for y in range(33))
 assert stub.started == [True], 'r must force a refresh'
 assert ' 46 %' in text and ' 61 %' in text and 'resets ' in text
-assert 'ACTIVE' in text and 'cached ' in text and 'retry ' in text
+assert 'Active' in text and 'Cached ' in text and 'retry ' in text
 assert 'rate limited - retry after 16:01' in text
-assert 'r Refresh usage' in text
+assert 'r Refresh' in text
 bar_row = next(screen.row(y) for y in range(33) if ' 46 %' in screen.row(y))
 assert account.GLYPHS['full'] in bar_row and account.GLYPHS['empty'] in bar_row
 assert len(bar_row) <= 2 + min(100 - 4, 72), 'Bar row must stay inside the card'

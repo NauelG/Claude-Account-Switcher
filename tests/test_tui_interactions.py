@@ -1,12 +1,13 @@
 """Text editing and human-readable automation views use no real user state."""
 from datetime import datetime
+import contextlib
 import importlib.machinery
 import importlib.util
 from pathlib import Path
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 loader = importlib.machinery.SourceFileLoader('account', str(ROOT / 'bin/ng-claude-account'))
@@ -92,6 +93,63 @@ class InteractionTests(unittest.TestCase):
             self.assertIn('1 h 40 min | 3 account(s)', details)
             self.assertIn('Next turn', details)
             self.assertNotIn('Next timer check /', details)
+
+    def test_authentication_state_is_separate_from_quota_state(self):
+        row = {'name': 'work', 'active': False, 'state': 'Saved', 'token': 'expired'}
+        cached = {'state': 'ok', 'cached_at': time.time() - 300, 'windows': {}}
+        self.assertEqual(account.ui_account_state(row, cached), 'Saved')
+        self.assertIn('Cached ', account.quota_status(cached))
+        self.assertIn('old', account.quota_status(cached))
+        self.assertEqual(account.ui_account_state(row, {'state': 'token rejected - log in again'}),
+                         'Login required')
+        self.assertEqual(account.ui_account_state(row, {'state': 'token renewal failed'}),
+                         'Needs attention')
+        self.assertEqual(account.quota_status(None, True), 'Loading...')
+        self.assertEqual(account.quota_status({'state': 'network unavailable'}), 'network unavailable')
+
+    def test_contextual_rename_targets_selected_account_without_switch_or_ack(self):
+        with patch.object(account, 'profiles', return_value=['personal', 'work']), \
+                patch.object(account, 'select', return_value=2) as choose, \
+                patch.object(account, 'account_details', return_value=['Work']), \
+                patch.object(account, 'edit_alias', return_value='Office'), \
+                patch.object(account, 'execute') as execute:
+            self.assertEqual(account.account_actions('work', None), ('Alias saved: Office.', False))
+        execute.assert_called_once_with('alias', 'work', 'Office')
+        choose.assert_called_once()  # No success acknowledgement screen.
+
+    def test_contextual_failure_keeps_actions_open_for_login(self):
+        usage = Mock()
+        with patch.object(account, 'profiles', return_value=['work']), \
+                patch.object(account, 'select', side_effect=[3, 4]) as choose, \
+                patch.object(account, 'account_details', return_value=['Work']), \
+                patch.object(account, 'renew_profile', side_effect=ValueError('Refresh rejected; log in again.')), \
+                patch.object(account, 'execute') as execute, \
+                patch.object(account, 'display_name', return_value='Work'):
+            result = account.account_actions('work', usage)
+        self.assertEqual(result, ('Login saved for Work.', False))
+        execute.assert_called_once_with('login', 'work')
+        self.assertIn('Error: Refresh rejected; log in again.', choose.call_args_list[1].args[2])
+        self.assertTrue(choose.call_args_list[1].kwargs['error'])
+        usage.start.assert_called_once_with(force=True)
+
+    def test_main_menu_returns_to_dashboard_with_toast(self):
+        with patch.object(account, 'startup_sync', return_value=[]), \
+                patch.object(account.UsageMonitor, 'start'), \
+                patch.object(account, 'account_actions', return_value=('Alias saved: Work.', False)), \
+                patch.object(account, 'select', side_effect=[('account', 'work'), None]) as choose:
+            account.menu()
+        second = choose.call_args_list[1]
+        self.assertEqual(second.args[2], ['Alias saved: Work.'])
+        self.assertFalse(second.kwargs['notice_error'])
+        self.assertGreater(second.kwargs['notice_until'], time.monotonic())
+
+    def test_profile_renewal_refuses_unverified_live_credentials(self):
+        with patch.object(account, 'tool_lock', return_value=contextlib.nullcontext()), \
+                patch.object(account, 'sync', return_value={'status': 'unverified', 'active': 'personal'}), \
+                patch.object(account, 'freshen') as refresh:
+            with self.assertRaisesRegex(ValueError, 'Reconcile the live credentials'):
+                account.renew_profile('work')
+            refresh.assert_not_called()
 
 
 if __name__ == '__main__':

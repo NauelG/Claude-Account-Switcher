@@ -49,7 +49,7 @@ usage, reconciliation and scheduled turns use the registry rather than a fixed p
 
 The full-screen menu uses Python's standard-library curses module. Its Claude ASCII
 logo and ACCOUNT SWITCHER subtitle appear in terminals at least 60 columns wide
-and enough rows for all accounts (33 rows for two, 37 for three). Smaller terminals
+and enough rows for all accounts (28 rows for two, 33 for three). Smaller terminals
 use a compact paginated account panel. A small terracotta `ng` signature sits right-aligned under the subtitle,
 or beside the compact header. The layout adapts when the terminal is resized.
 
@@ -64,10 +64,18 @@ selectable. Status and errors have separate panels.
 - Home/End: select the first/last item.
 - Page Up/Page Down: scroll long account pickers.
 - `[` / `]`: previous/next account page on the compact dashboard.
+- `/`: search by alias, profile name or email. Esc clears the current filter.
 - Enter: activate the selected item.
 - Esc or q: return from a submenu or exit the main menu.
 - r: refresh quota usage (main menu).
 - Ctrl-C: cancel and restore terminal state.
+
+Accounts are selectable directly. Enter opens contextual Switch, Details, Rename
+alias, Renew, Login, Restore and Remove actions for that account. Successful
+actions return to the dashboard with a six-second notification; errors stay visible
+until the user chooses another action. Quota read status and token expiry are
+displayed separately. Alias and search fields support selection, a visible cursor,
+Left/Right, Home/End, Delete, Backspace and Ctrl+U, with inline validation.
 
 Set `NO_COLOR=1` to disable colors; selection remains highlighted in reverse video.
 Direct subcommands work without a terminal; the menu requires both terminal input

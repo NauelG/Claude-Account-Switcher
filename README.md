@@ -115,33 +115,49 @@ to pick up the change. Requests already in progress keep their existing token.
 
 ## Inside the TUI
 
-The dashboard highlights the active account and shows each account's usage before
-you choose where to work. Missing data, expired sessions, cached quota readings,
-and rate-limit cooldowns appear as status messages rather than guessed numbers.
+The dashboard opens with the active account selected. Move directly between
+accounts with the arrow keys and press Enter for actions on that account. Use `/`
+to filter by alias, profile name, or email; matching is case-insensitive. Esc clears
+an applied filter, and `q` exits.
 
-**Switching accounts** opens a picker:
+Authentication and quota have separate labels: **Active**, **Saved**, **Login
+required**, **Not registered**, or **Needs attention** describe the account. Token
+expiry is not a quota reset. **Loading**, **Live reading**, **Cached HH:MM** with
+age, and unavailable/error messages describe the quota reading.
+
+**Enter on Work** opens its contextual actions:
 
 ```text
   CLAUDE ACCOUNT SWITCHER  ng
 
-  Choose an account to switch
-  Active account: Personal
+  Account actions
+  Work (work) | work@example.test
+  Account: Saved
+  Access token: valid until 17:00 (120 min)
+  Quota: Cached 14:55 | 5 min old
 
-  > Personal (personal) | personal@example.test  [active]
-    Work (work) | work@example.test  [saved]
-    Lab (lab) | lab@example.test  [saved]
+  > Switch to this account
+    Account details
+    Rename alias
+    Renew token
+    Log in / re-authenticate
+    Restore credentials
+    Remove profile
     Back
 
   Up/Down Move   Enter Select   Esc Back
 ```
 
-Use **Manage accounts** to add or remove profiles, **Edit alias** to change display
-names, and **Automation** to inspect or toggle either timer. Removing an inactive
+Use **Manage accounts** to add or remove profiles, an account's **Rename alias**
+action to change its display name, and **Automation** to inspect or toggle either timer. Removing an inactive
 profile archives its credentials privately; an active profile must be switched
 away from first.
 
 The full dashboard adapts to terminal size. Small terminals use compact quota
 rows; larger account lists are paginated instead of pushing actions off-screen.
+Switching, renaming, and other successful actions return to the dashboard with a
+short-lived notification. Errors stay visible; account actions remain available
+for retrying, renewing, or logging in again.
 
 | Key | Action |
 |---|---|
@@ -153,9 +169,10 @@ rows; larger account lists are paginated instead of pushing actions off-screen.
 | `Page Up` / `Page Down` | Scroll long account pickers |
 | `[` / `]` | Previous / next account page on the compact dashboard |
 | `r` | Refresh usage on the dashboard |
+| `/` | Search accounts by alias, profile name or email |
 | `Ctrl+C` | Cancel and restore the terminal |
 
-Alias fields select their current text on entry. Type to replace it, or use
+Alias and search fields select their current text on entry. Type to replace it, or use
 Left/Right, Home/End, Backspace and Delete to edit in place. `Ctrl+U` clears the
 field. Validation stays inside the editor without discarding your input.
 
@@ -236,6 +253,11 @@ journalctl --user -u ng-claude-account-window.service
 ```
 
 User timers run without an open login session only when user lingering is enabled.
+The **Automation** menu shows activation, last result, next run or account turn,
+and remaining time. The account's next turn is displayed separately from the
+timer's one-minute polling checks. Enable/Disable actions refresh that view in
+place; failures remain visible with retry controls.
+
 The installer does not change lingering. A oneshot service being `inactive`
 between runs is normal; the timer is what must be `active`.
 

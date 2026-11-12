@@ -539,8 +539,8 @@ assert timer['Timer']['OnCalendar'] == 'daily' and timer['Timer']['Persistent'] 
 assert timer['Install']['WantedBy'] == 'timers.target'
 
 # ---------------------------------------------------------- menu routing
-# Status and back; switch cancelled; switch to principal and back; exit.
-with patch.object(account, 'select', side_effect=[1, 0, 0, None, 0, 0, 0, None]):
+# Select principal directly, switch from its contextual actions, then exit.
+with patch.object(account, 'select', side_effect=[('account', 'principal'), 0, None]):
     account.menu()
 assert account.active() == 'principal'
 with patch('sys.argv', ['ng-claude-account']), patch.dict('os.environ', {}, clear=True), \
