@@ -106,6 +106,8 @@ class InteractionTests(unittest.TestCase):
                          'Needs attention')
         self.assertEqual(account.quota_status(None, True), 'Loading...')
         self.assertEqual(account.quota_status({'state': 'network unavailable'}), 'network unavailable')
+        self.assertIn('Cached ', account.quota_status({'state': 'ok', 'fetched_at': time.time() - 300}))
+        self.assertEqual(account.quota_status({'state': 'ok', 'fetched_at': time.time()}), 'Live reading')
 
     def test_contextual_rename_targets_selected_account_without_switch_or_ack(self):
         with patch.object(account, 'profiles', return_value=['personal', 'work']), \

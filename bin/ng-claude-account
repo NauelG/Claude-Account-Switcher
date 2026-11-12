@@ -1395,7 +1395,11 @@ def ui_account_state(row, result):
 
 
 def quota_status(result, loading=False):
-    cached_at = (result.get("cached_at") or (result.get("fetched_at") if result.get("cache_hit") else None)) if result else None
+    cached_at = result.get("cached_at") if result else None
+    fetched_at = result.get("fetched_at") if result else None
+    if fetched_at and not cached_at and (result.get("cache_hit") or
+                                        time.time() - fetched_at >= USAGE_FRESH_SECONDS):
+        cached_at = fetched_at
     if cached_at:
         age = max(0, time.time() - cached_at)
         text = f"Cached {clock(cached_at)} | " + ("just now" if age < 60 else duration(age - age % 60) + " old")

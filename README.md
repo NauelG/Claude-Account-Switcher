@@ -124,6 +124,8 @@ Authentication and quota have separate labels: **Active**, **Saved**, **Login
 required**, **Not registered**, or **Needs attention** describe the account. Token
 expiry is not a quota reset. **Loading**, **Live reading**, **Cached HH:MM** with
 age, and unavailable/error messages describe the quota reading.
+Readings also become labeled as cached when the dashboard has been open long
+enough for their freshness window to expire; press `r` to request an update.
 
 **Enter on Work** opens its contextual actions:
 
