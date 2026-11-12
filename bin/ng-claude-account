@@ -1,0 +1,1948 @@
+#!/usr/bin/env python3
+"""Claude Account Switcher: manage OAuth profiles on Linux without changing application configuration."""
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+import contextlib
+import curses
+from datetime import datetime
+import fcntl
+import hashlib
+import io
+import json
+import locale
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+HOME = Path.home()
+STORE = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share")) / "claude-account"
+LIVE = HOME / ".claude/.credentials.json"
+LEGACY_PROFILES = ("principal", "secundaria")
+ERRORS = (OSError, ValueError, KeyError, subprocess.CalledProcessError)
+
+
+def valid_profile_name(name):
+    return (isinstance(name, str) and name not in ("profiles", "window-schedule")
+            and re.fullmatch(r"[a-z][a-z0-9_-]{0,39}", name) is not None)
+
+
+def profiles():
+    """Ordered profile registry; old installations keep their existing names."""
+    path = STORE / "profiles.json"
+    if not path.exists():
+        return list(LEGACY_PROFILES)
+    names = json.loads(path.read_text())
+    if (not isinstance(names, list) or not all(valid_profile_name(n) for n in names)
+            or len(set(names)) != len(names)):
+        raise ValueError("Invalid profile registry in " + str(path))
+    return names
+
+
+def save_profiles(names):
+    if not all(valid_profile_name(n) for n in names) or len(set(names)) != len(names):
+        raise ValueError("Invalid profile names.")
+    write_json(STORE / "profiles.json", list(names))
+
+
+def registered_profiles():
+    return [name for name in profiles() if credential_path(name).is_file()]
+
+
+def credential_path(name):
+    if not valid_profile_name(name):
+        raise ValueError("Profile names must start with a lowercase letter and contain only "
+                         "lowercase letters, digits, underscores or hyphens (max 40 characters).")
+    return STORE / (name + ".json")
+
+
+def load(path):
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        raise ValueError(f"Invalid credentials object in {path}")
+    oauth = data.get("claudeAiOauth", {})
+    if not isinstance(oauth, dict):
+        raise ValueError(f"Invalid OAuth credentials in {path}")
+    if not all(isinstance(oauth.get(k), str) and oauth[k]
+               for k in ("accessToken", "refreshToken")):
+        raise ValueError(f"Missing OAuth credentials in {path}")
+    if (type(oauth.get("expiresAt")) not in (int, float)
+            or not math.isfinite(oauth["expiresAt"])):
+        raise ValueError(f"Missing OAuth expiry in {path}")
+    return data
+
+
+def write_bytes(path, payload):
+    """Atomically replace path with owner-only content."""
+    fd, temporary = tempfile.mkstemp(prefix=".credentials-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def write_json(path, data):
+    write_bytes(path, (json.dumps(data) + "\n").encode())
+
+
+def identity_path(name):
+    return STORE / (name + ".identity.json")
+
+
+def identity(name):
+    path = identity_path(name)
+    if not path.exists():
+        return {}
+    value = json.loads(path.read_text())
+    if not isinstance(value, dict):
+        raise ValueError(f"Invalid identity metadata: {path}")
+    for field in ("alias", "email", "accountUuid"):
+        if field in value and not isinstance(value[field], str):
+            raise ValueError(f"Invalid identity field: {field}")
+    return value
+
+
+def safe_text(value):
+    return "".join(c for c in value if c.isprintable())
+
+
+def profile_label(name):
+    if name is None:
+        return "unmanaged"
+    info = identity(name)
+    alias = safe_text(info.get("alias", name))
+    label = f"{alias} ({name})" if alias != name else name
+    return f"{label} | {safe_text(info.get('email', 'identity pending'))}"
+
+
+def capture_identity(name, config_dir):
+    # Only associate metadata produced by this profile's isolated login.
+    # Global ~/.claude.json is deliberately never consulted.
+    previous = identity(name)
+    info = {"alias": previous.get("alias", name)}
+    path = config_dir / ".claude.json"
+    try:
+        config = json.loads(path.read_text())
+        account = config.get("oauthAccount", {}) if isinstance(config, dict) else {}
+        if isinstance(account, dict):
+            for source, target in (("emailAddress", "email"), ("accountUuid", "accountUuid")):
+                if isinstance(account.get(source), str) and account[source]:
+                    info[target] = safe_text(account[source])
+    except (OSError, ValueError):
+        pass
+    info["source"] = "isolated-login"
+    info["capturedAt"] = int(time.time())
+    write_json(identity_path(name), info)
+
+
+def expiring(data, margin_ms=120_000):
+    return data["claudeAiOauth"]["expiresAt"] <= time.time() * 1000 + margin_ms
+
+
+def same_tokens(first, second):
+    a, b = first["claudeAiOauth"], second["claudeAiOauth"]
+    return a["accessToken"] == b["accessToken"] and a["refreshToken"] == b["refreshToken"]
+
+
+def display_name(name):
+    try:
+        return safe_text(identity(name).get("alias", name))
+    except ERRORS:
+        return name
+
+
+# ------------------------------------------------------------- active state
+#
+# ~/.claude/.credentials.json is a regular file holding the active account's
+# credentials. Claude Code saves it by writing a temporary file and renaming it
+# over the path, which replaces any symlink. The active profile is therefore
+# recorded separately, and the file is reconciled with the saved profiles by
+# sync() before every action, so renewals made by others are never lost.
+
+def state_path():
+    return STORE / "active"
+
+
+def linked_profile():
+    """Profile a credentials symlink from older versions points to, if any."""
+    if not LIVE.is_symlink():
+        return None
+    for name in profiles():
+        if LIVE.resolve() == credential_path(name).resolve():
+            return name
+    raise ValueError("The credentials file is a link owned by another manager.")
+
+
+def active():
+    try:
+        name = state_path().read_text().strip()
+    except FileNotFoundError:
+        return linked_profile()
+    if name not in profiles():
+        raise ValueError(f"Invalid active-profile state in {state_path()}")
+    return name
+
+
+def set_active(name):
+    write_bytes(state_path(), (name + "\n").encode())
+
+
+def write_live(data):
+    LIVE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    write_json(LIVE, data)  # Atomic replace, the same way Claude Code saves it.
+
+
+def read_live_raw():
+    """Current credentials object, including shared non-Claude sections, or {}."""
+    try:
+        data = json.loads(LIVE.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_profile(name, data):
+    write_json(credential_path(name), data)
+
+
+def backup_live():
+    """Keep an exact private copy of the current credentials file."""
+    if not LIVE.exists():
+        return None
+    raw = LIVE.read_bytes()
+    fd, backup = tempfile.mkstemp(prefix="displaced-", suffix=".json", dir=STORE)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+    return backup
+
+
+@contextlib.contextmanager
+def tool_lock():
+    os.umask(0o077)
+    STORE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (STORE / ".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+# ----------------------------------------------------------- OAuth helpers
+
+OAUTH_TOKEN_URL = "https://claude.ai/v1/oauth/token"
+OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
+PLUGIN_LOCK_DIR = Path(os.environ.get("OPENCODE_CLAUDE_AUTH_REFRESH_LOCK_DIR")
+                       or HOME / ".local/share/opencode")
+# claude.ai sits behind Cloudflare, which rejects Python's default User-Agent
+# ("Python-urllib/3.x") with HTTP 403, error 1010, before reaching the OAuth
+# server. Every request goes through http_json() so it always identifies itself.
+USER_AGENT = "ng-claude-account/1.0"
+
+
+def http_json(url, data=None, headers=None, timeout=8):
+    """POST (with data) or GET a JSON endpoint; HTTP errors propagate as HTTPError."""
+    request = urllib.request.Request(url, data=data, headers={
+        "User-Agent": USER_AGENT, **(headers or {})})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+
+def refresh_oauth(oauth):
+    """Exchange a refresh token; returns updated OAuth credentials (never logs tokens).
+
+    Anthropic rotates the refresh token on every exchange (the previous one stops
+    working) and returns its new lifetime, about 28 days, which is stored like
+    Claude Code does in refreshTokenExpiresAt.
+    """
+    body = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "client_id": OAUTH_CLIENT_ID,
+        "refresh_token": oauth["refreshToken"],
+    }).encode()
+    try:
+        result = http_json(OAUTH_TOKEN_URL, data=body, timeout=20, headers={
+            "Content-Type": "application/x-www-form-urlencoded"})
+    except urllib.error.HTTPError as error:
+        try:
+            raw = error.read()
+            detail = json.loads(raw).get("error", "")
+        except (OSError, ValueError, AttributeError):
+            detail = ""
+        if detail == "invalid_grant":
+            raise ValueError("The saved refresh token was rejected; log in to this account "
+                             "again.") from None
+        raise ValueError(f"Token refresh failed (HTTP {error.code}); nothing was changed. "
+                         "Retry later, or log in again if it persists.") from None
+    except (OSError, ValueError):
+        raise ValueError("Token refresh failed (network error); nothing was changed.") from None
+    if not isinstance(result, dict) or not isinstance(result.get("access_token"), str) \
+            or not result["access_token"]:
+        raise ValueError("Invalid refresh response; nothing was changed.")
+    try:
+        lifetime = float(result["expires_in"])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("Invalid refresh response; nothing was changed.") from None
+    if lifetime <= 60:
+        raise ValueError("Refreshed token lifetime is too short to use.")
+    now = time.time()
+    updated = dict(oauth)
+    updated.update(accessToken=result["access_token"],
+                   refreshToken=result.get("refresh_token") or oauth["refreshToken"],
+                   expiresAt=int(now * 1000 + lifetime * 1000))
+    session = result.get("refresh_token_expires_in")
+    if type(session) in (int, float) and math.isfinite(session) and session > 0:
+        updated["refreshTokenExpiresAt"] = int(now * 1000 + session * 1000)
+    else:
+        updated.pop("refreshTokenExpiresAt", None)  # Never keep a stale session expiry.
+    if isinstance(result.get("scope"), str) and result["scope"].split():
+        updated["scopes"] = result["scope"].split()
+    return updated
+
+
+def freshen(path):
+    """Refresh a saved (inactive) profile's token when it is about to expire."""
+    data = load(path)
+    if not expiring(data):
+        return data
+    data["claudeAiOauth"] = refresh_oauth(data["claudeAiOauth"])
+    write_json(path, data)
+    return data
+
+
+def plugin_lock_path():
+    # The opencode-claude-auth plugin serialises refreshes of file-based
+    # credentials (account source "file") with this lock file. Holding it while
+    # renewing or replacing ~/.claude keeps the two from racing on one token.
+    digest = hashlib.sha256(b"file").hexdigest()[:16]
+    return PLUGIN_LOCK_DIR / f"claude-auth-refresh-{digest}.lock"
+
+
+def plugin_lock_ttl():
+    try:
+        return max(1.0, int(os.environ["OPENCODE_CLAUDE_AUTH_REFRESH_LOCK_TTL_MS"]) / 1000)
+    except (KeyError, ValueError):
+        return 20.0  # The plugin's default.
+
+
+@contextlib.contextmanager
+def plugin_refresh_lock(wait=25.0):
+    path = plugin_lock_path()
+    deadline = time.monotonic() + wait
+    fd = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    while True:
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.write(fd, json.dumps({"pid": os.getpid(), "ts": int(time.time() * 1000)}).encode())
+            break
+        except FileExistsError:
+            try:
+                stale = time.time() - path.stat().st_mtime > plugin_lock_ttl()
+            except FileNotFoundError:
+                continue
+            if stale:
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                continue
+            if time.monotonic() >= deadline:
+                raise ValueError("OpenCode is renewing this token right now; try again shortly.")
+            time.sleep(0.25)
+        except OSError:
+            fd = None  # Unusable lock directory: proceed best-effort, as the plugin does.
+            break
+    try:
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+            with contextlib.suppress(OSError):
+                path.unlink()
+
+
+def refresh_live():
+    """Renew the token in ~/.claude, coordinating with the OpenCode plugin.
+
+    Returns (credentials, refreshed). When another process renewed the token
+    while this one waited for the lock, its result is used instead.
+    """
+    with plugin_refresh_lock():
+        data = load(LIVE)
+        if not expiring(data, 60_000):
+            return data, False
+        data["claudeAiOauth"] = refresh_oauth(data["claudeAiOauth"])
+        write_live(data)
+        return data, True
+
+
+class IdentityUnavailable(Exception):
+    """The account owning a token could not be determined (message is display-safe)."""
+
+
+_ACCOUNTS = {}
+
+
+def account_of(token):
+    """Account that owns an access token, as reported by Anthropic."""
+    key = hashlib.sha256(token.encode()).hexdigest()
+    if key in _ACCOUNTS:
+        return _ACCOUNTS[key]
+    try:
+        payload = http_json(PROFILE_URL, headers={
+            "Authorization": "Bearer " + token, "anthropic-beta": "oauth-2025-04-20"})
+    except urllib.error.HTTPError as error:
+        raise IdentityUnavailable(f"HTTP {error.code}") from None
+    except (OSError, ValueError):
+        raise IdentityUnavailable("network error") from None
+    account = payload.get("account") if isinstance(payload, dict) else None
+    uuid = account.get("uuid") if isinstance(account, dict) else None
+    if not isinstance(uuid, str) or not uuid:
+        raise IdentityUnavailable("unexpected response")
+    email = account.get("email")
+    result = {"uuid": safe_text(uuid), "email": safe_text(email) if isinstance(email, str) else ""}
+    _ACCOUNTS[key] = result
+    return result
+
+
+def profile_uuid(name):
+    """Account UUID of a saved profile, learned from Anthropic if never captured."""
+    try:
+        info = identity(name)
+        if info.get("accountUuid"):
+            return info["accountUuid"]
+        data = load(credential_path(name))
+        if expiring(data, 60_000):
+            return None
+        account = account_of(data["claudeAiOauth"]["accessToken"])
+    except ERRORS + (IdentityUnavailable,):
+        return None
+    info.setdefault("alias", name)
+    info["accountUuid"] = account["uuid"]
+    if account["email"] and not info.get("email"):
+        info["email"] = account["email"]
+    write_json(identity_path(name), info)
+    return account["uuid"]
+
+
+# --------------------------------------------------------- reconciliation
+
+LAST_SYNC = {"status": "unsynced", "notes": []}
+SYNC_PROBLEMS = {"unverified": "unverified change in ~/.claude",
+                 "unknown": "unregistered account in ~/.claude",
+                 "missing": "no credentials in ~/.claude",
+                 "invalid": "~/.claude credentials unreadable"}
+
+
+def sync():
+    """Reconcile ~/.claude/.credentials.json with the saved profiles.
+
+    Call with tool_lock() held. Returns {"active", "status", "notes"} where
+    status is ok, unverified, unknown, missing or invalid. Credentials whose
+    owner cannot be verified are left in place; anything that must later be
+    overwritten is first saved to its profile or backed up.
+    """
+    global LAST_SYNC
+    notes = []
+    if not (STORE / "profiles.json").exists():
+        save_profiles(profiles())  # Persist legacy names without moving their credentials.
+
+    def finish(status, name, extra=()):
+        global LAST_SYNC
+        LAST_SYNC = {"status": status, "notes": notes + list(extra)}
+        return {"active": name, **LAST_SYNC}
+
+    legacy = linked_profile()
+    if legacy:
+        write_live(load(LIVE))
+        set_active(legacy)
+        notes.append("Converted the credentials link into a regular file "
+                     "(Claude Code replaces links when it saves).")
+    current = active()
+    registered = registered_profiles()
+    if not LIVE.exists():
+        return finish("missing", current, ["No credentials in ~/.claude. Switch to a saved "
+                                           "account or log in."])
+    try:
+        live = load(LIVE)
+    except ERRORS:
+        return finish("invalid", current, ["~/.claude/.credentials.json is unreadable. Restore a "
+                                           "saved account to fix it."])
+    if not registered:
+        name = "principal"
+        if name not in profiles():
+            save_profiles([*profiles(), name])
+        save_profile(name, live)
+        set_active(name)
+        return finish("ok", name, ["Registered the current credentials as principal."])
+    if current in registered:
+        try:
+            if same_tokens(live, load(credential_path(current))):
+                return finish("ok", current)
+        except ERRORS:
+            pass
+    # The file changed outside this tool: typically Claude Code or OpenCode
+    # renewing the token, sometimes a direct login. Verify its owner first.
+    try:
+        if expiring(live, 60_000):
+            live, _ = refresh_live()
+        owner = account_of(live["claudeAiOauth"]["accessToken"])
+    except IdentityUnavailable as error:
+        return finish("unverified", current, [
+            f"Credentials changed outside this tool, but their account could not be verified "
+            f"({error}). They were left untouched."])
+    except ERRORS as error:
+        return finish("unverified", current, [
+            f"Credentials changed outside this tool and could not be renewed to verify them "
+            f"({error}). They were left untouched."])
+    candidates = ([current] if current in registered else []) + [
+        n for n in registered if n != current]
+    match = next((n for n in candidates if profile_uuid(n) == owner["uuid"]), None)
+    if match is None:
+        return finish("unknown", current, [
+            f"~/.claude holds an unregistered account ({owner['email'] or 'unknown email'}). "
+            "Log in to register it, or switch to restore a saved account."])
+    save_profile(match, live)
+    if match != current:
+        set_active(match)
+        notes.append(f"~/.claude now holds {display_name(match)}'s credentials (changed outside "
+                     "this tool); it is now the active account.")
+    else:
+        notes.append(f"Saved the token renewed outside this tool for {display_name(match)}.")
+    return finish("ok", match)
+
+
+def preserve_live(current):
+    """Before replacing ~/.claude, keep what is there.
+
+    Credentials still belonging to the active profile are saved into it;
+    anything else is backed up. Returns the backup path, if one was made.
+    """
+    try:
+        live = load(LIVE)
+    except ERRORS:
+        return backup_live()
+    if current and credential_path(current).exists():
+        try:
+            if same_tokens(live, load(credential_path(current))):
+                return None
+            if not expiring(live, 0) and profile_uuid(current) == account_of(
+                    live["claudeAiOauth"]["accessToken"])["uuid"]:
+                save_profile(current, live)
+                return None
+        except ERRORS + (IdentityUnavailable,):
+            pass
+    return backup_live()
+
+
+def token_summary(data):
+    seconds = data["claudeAiOauth"]["expiresAt"] / 1000 - time.time()
+    if seconds <= 0:
+        return "expired"
+    until = datetime.fromtimestamp(data["claudeAiOauth"]["expiresAt"] / 1000).strftime("%H:%M")
+    return f"valid until {until} ({int(seconds / 60)} min)"
+
+
+SESSION_WARN_DAYS = 5
+
+
+def session_days(data):
+    """Days left before the refresh token expires, or None when unknown."""
+    expires = data["claudeAiOauth"].get("refreshTokenExpiresAt")
+    if type(expires) not in (int, float) or not math.isfinite(expires):
+        return None
+    return (expires / 1000 - time.time()) / 86400
+
+
+def session_summary(data):
+    """The login session lasts while the refresh token is renewed (~28 days each)."""
+    days = session_days(data)
+    if days is None:
+        return "session expiry unknown"
+    if days <= 0:
+        return "session expired - log in again"
+    until = datetime.fromtimestamp(data["claudeAiOauth"]["refreshTokenExpiresAt"] / 1000)
+    text = f"session until {until.strftime('%b %d')} ({days:.0f} d)"
+    return text + " - renew soon" if days <= SESSION_WARN_DAYS else text
+
+
+def diagnose():
+    """Offline, read-only check of the local credential layout."""
+    problems, notices = [], []
+    try:
+        legacy = linked_profile()
+        current = active()
+    except ERRORS as error:
+        legacy, current = None, None
+        problems.append(str(error))
+    if legacy:
+        notices.append("The credentials file is a link from an older version; it becomes a "
+                       "regular file on the next run.")
+    print(f"Active profile: {profile_label(current) if current else 'none recorded'}")
+    if not LIVE.exists():
+        problems.append("~/.claude/.credentials.json is missing.")
+    else:
+        try:
+            live = load(LIVE)
+            print(f"Credentials file: {'link (older version)' if legacy else 'regular file'}, "
+                  f"token {token_summary(live)}")
+            if current and credential_path(current).exists():
+                if same_tokens(live, load(credential_path(current))):
+                    print("In sync with the active profile.")
+                else:
+                    notices.append("Changed outside this tool (for example, Claude Code renewed "
+                                   "the token). It is verified and saved on the next run.")
+            elif current is None:
+                problems.append("No active profile recorded; run status to reconcile.")
+        except ERRORS:
+            problems.append("~/.claude/.credentials.json is malformed.")
+    for name in profiles():
+        try:
+            label = profile_label(name)
+            verified = bool(identity(name).get("accountUuid"))
+        except ERRORS:
+            label, verified = name + " | invalid identity metadata", False
+            problems.append(f"Identity metadata for {name} is malformed.")
+        path = credential_path(name)
+        if not path.exists():
+            state = "not registered"
+        else:
+            try:
+                saved = load(path)
+                state = f"saved token {token_summary(saved)}; {session_summary(saved)}"
+                days = session_days(saved)
+                if days is not None and days <= 0:
+                    problems.append(f"The login session of {name} has expired; log in again.")
+                elif days is not None and days <= SESSION_WARN_DAYS:
+                    notices.append(f"The login session of {name} ends in {days:.0f} days; "
+                                   "renew its token to extend it.")
+            except ERRORS:
+                state = "invalid credentials"
+                problems.append(f"Saved credentials for {name} are malformed.")
+            if not verified:
+                state += "; account id not captured yet"
+        print(f"{'*' if name == current else '-'} {label}: {state}")
+    for notice in notices:
+        print(f"Note: {notice}")
+    for problem in problems:
+        print(f"Issue: {problem}")
+    print("This check is offline: it does not verify revocation, account identity or quota.")
+    if problems:
+        print("Use switch or repair <profile> to restore a saved account; the current file is "
+              "saved or backed up first.")
+    else:
+        print("Local credential layout is healthy.")
+    return not problems
+
+
+def check_environment():
+    if sys.platform != "linux":
+        raise ValueError("This tool currently supports Linux credential files only, not macOS Keychain.")
+    for variable in ("CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+                     "CLAUDE_CODE_OAUTH_TOKEN"):
+        if os.environ.get(variable):
+            raise ValueError(f"Unset {variable}: it can override the default credentials.")
+
+
+def execute(command, profile=None, alias=None):
+    if command == "accounts":
+        return manage_accounts(profile, alias)
+    if command == "schedule":
+        schedule_control(profile, alias or "windows")
+        return
+    if command == "doctor":
+        return diagnose()
+    if command == "prime-next":
+        with tool_lock():
+            return prime_next()
+    if command == "usage":
+        if LIVE.exists() or LIVE.is_symlink() or STORE.exists():
+            with tool_lock():
+                for note in sync()["notes"]:
+                    print(note)
+        results = collect_usage()
+        accounts, _ = account_overview()
+        for account in accounts:
+            mark = GLYPHS["active"] if account["active"] else GLYPHS["idle"]
+            tag = "  (active)" if account["active"] else ""
+            print(f"{mark} {account['alias']} | {account['email']}{tag}")
+            result = results[account["name"]]
+            if result["state"] != "ok":
+                print(f"    {result['state']}")
+                continue
+            if usage_note(result):
+                print(f"    ({usage_note(result)})")
+            for key, short in USAGE_WINDOWS:
+                window = result["windows"].get(key)
+                if window:
+                    used = window["used"]
+                    depth = ansi_colors()
+                    percent = f"{used:3.0f} %"
+                    if depth:
+                        percent = ansi_color(used / 100, depth) + percent + "\x1b[0m"
+                    print(f"    {short}  {ansi_bar(used, 24, depth)}  {percent}  "
+                          f"{format_reset(window['resets'])}")
+        print("Usage comes from Claude's undocumented OAuth usage endpoint and may change.")
+        return
+    installed = LIVE.exists() or LIVE.is_symlink() or STORE.exists()
+    if not installed and command in ("status", "init", "renew", "renew-all", "switch", "repair"):
+        # Nothing to reconcile yet: report without creating any state.
+        if command in ("status", "init", "renew-all"):
+            print("No Claude credentials yet. Log in with: ng-claude-account login principal")
+            return
+        raise ValueError("No Claude credentials yet. Log in first: "
+                         "ng-claude-account login principal")
+    with tool_lock():
+        if command == "alias":
+            if not alias or not alias.strip() or len(alias) > 48 or not alias.isprintable():
+                raise ValueError("Alias must contain 1-48 printable characters.")
+            info = identity(profile)
+            info["alias"] = alias.strip()
+            write_json(identity_path(profile), info)
+            print(f"Updated profile: {profile_label(profile)}")
+            return
+        state = sync()
+        for note in state["notes"]:
+            print(note)
+        if command == "status":
+            print_status(state)
+        elif command == "init":
+            if state["active"]:
+                print(f"Active account: {profile_label(state['active'])}")
+            else:
+                print("Nothing to register: ~/.claude has no usable credentials.")
+        elif command == "renew":
+            renew(state)
+        elif command == "renew-all":
+            return renew_all(state)
+        elif command == "login":
+            login(profile, state)
+        else:
+            switch(profile, state, restore=command == "repair")
+
+
+def print_status(state):
+    current = state["active"]
+    print(f"Active account: {profile_label(current) if current else 'none'}")
+    try:
+        print(f"Credentials file: ~/.claude/.credentials.json, token {token_summary(load(LIVE))}")
+    except ERRORS:
+        print("Credentials file: missing or unreadable")
+    if state["status"] != "ok":
+        print(f"Attention: {SYNC_PROBLEMS[state['status']]}")
+    for name in profiles():
+        path = credential_path(name)
+        detail = "not registered"
+        if path.exists():
+            try:
+                saved = load(path)
+                detail = f"saved token {token_summary(saved)}; {session_summary(saved)}"
+            except ERRORS:
+                detail = "invalid credentials"
+        print(f"  {'*' if name == current else '-'} {profile_label(name)}: {detail}")
+    print("After a switch, OpenCode may keep its previous token for up to 30 seconds.")
+    if prime_state_path().exists():
+        schedule = json.loads(prime_state_path().read_text())
+        if schedule.get("next") in profiles():
+            print(f"Window schedule: next {display_name(schedule['next'])}, "
+                  f"not before {clock(schedule['attempted_at'] + prime_interval())}")
+            print(f"Last turn: {safe_text(schedule.get('result', 'unknown'))}")
+
+
+def renew(state):
+    current = state["active"]
+    if state["status"] != "ok" or current is None:
+        raise ValueError("Cannot renew: " + SYNC_PROBLEMS.get(state["status"], "no active account")
+                         + ". Restore or switch to a saved account first.")
+    data = load(LIVE)
+    if not expiring(data):
+        print(f"The token for {display_name(current)} is still {token_summary(data)}; "
+              "no renewal needed.")
+        return
+    data, refreshed = refresh_live()
+    save_profile(current, data)
+    if refreshed:
+        print(f"Renewed the token for {display_name(current)}: {token_summary(data)}.")
+    else:
+        print(f"Another process had just renewed the token for {display_name(current)}; saved it.")
+
+
+def renew_all(state):
+    """Renew every registered account whose access token is expired or expiring.
+
+    Valid tokens are left alone: each renewal rotates the refresh token, so
+    renewing early gains nothing. Run daily (see the systemd timer), this also
+    keeps idle accounts signed in, because every renewal restarts the ~28-day
+    lifetime of their refresh token. One failure does not stop the others.
+    Returns False when any account needs attention.
+    """
+    ok = True
+    current = state["active"]
+    for name in profiles():
+        path = credential_path(name)
+        if not path.exists():
+            continue
+        label = display_name(name) + (" (active)" if name == current else "")
+        try:
+            if name == current:
+                if state["status"] != "ok":
+                    raise ValueError("skipped: " + SYNC_PROBLEMS[state["status"]])
+                data = load(LIVE)
+                if expiring(data):
+                    data, refreshed = refresh_live()
+                    save_profile(name, data)
+                    outcome = "renewed" if refreshed else "renewed by another process"
+                else:
+                    outcome = "still valid"
+            else:
+                data = load(path)
+                if expiring(data):
+                    data = freshen(path)
+                    outcome = "renewed"
+                else:
+                    outcome = "still valid"
+            print(f"{label}: {outcome}, {token_summary(data)}; {session_summary(data)}")
+        except ERRORS as error:
+            ok = False
+            print(f"{label}: {error}")
+    return ok
+
+
+def login(profile, state):
+    # Claude writes settings and account metadata next to the credentials, so the
+    # login runs in a temporary configuration directory.
+    with tempfile.TemporaryDirectory(prefix=".login-", dir=STORE) as tmp:
+        env = dict(os.environ, CLAUDE_CONFIG_DIR=tmp)
+        subprocess.run(["claude", "auth", "login"], env=env, check=True)
+        oauth = load(Path(tmp) / ".credentials.json")["claudeAiOauth"]
+        data = read_live_raw()  # Keep MCP and other shared sections.
+        data["claudeAiOauth"] = oauth
+        # Clear stale identity first, so a partial failure cannot show an old
+        # account's email beside a newly authenticated token.
+        info = identity(profile)
+        write_json(identity_path(profile), {"alias": info.get("alias", profile)})
+        save_profile(profile, data)
+        capture_identity(profile, Path(tmp))
+        # Cached usage and cooldowns belonged to the previous login.
+        usage_cache_path(profile).unlink(missing_ok=True)
+    current = state["active"]
+    if profile == current or current is None:
+        with plugin_refresh_lock():
+            backup = preserve_live(current) if profile != current else (
+                backup_live() if state["status"] != "ok" else None)
+            write_live(data)
+        set_active(profile)
+        if backup:
+            print(f"Preserved the previous credentials file: {backup}")
+        print(f"Logged in {profile_label(profile)}; it is the active account.")
+    else:
+        print(f"Saved authentication for {profile_label(profile)}. "
+              f"Active account remains {display_name(current)}.")
+    uuid = identity(profile).get("accountUuid")
+    twins = [n for n in profiles() if n != profile and uuid and identity(n).get("accountUuid") == uuid]
+    if twins:
+        print(f"Warning: this is the same Claude account as {display_name(twins[0])}.")
+
+
+def switch(profile, state, restore=False):
+    current = state["active"]
+    available = registered_profiles()
+    if profile is not None:
+        target = profile
+    elif current in available:
+        target = available[(available.index(current) + 1) % len(available)]
+    else:
+        target = available[0] if available else None
+    if target is None:
+        raise ValueError("No registered accounts. Add one with: ng-claude-account accounts add <name>")
+    if target == current and state["status"] == "ok":
+        print(f"{'Already in place' if restore else 'Already active'}: {profile_label(target)}")
+        return
+    path = credential_path(target)
+    if not path.exists():
+        raise ValueError(f"Authenticate this account first: ng-claude-account login {target}")
+    target_data = freshen(path)
+    with plugin_refresh_lock():
+        # Save what ~/.claude holds now (including a renewal made since sync)
+        # into its own profile, or back it up, before replacing it.
+        backup = preserve_live(current)
+        data = read_live_raw()  # MCP and other sections are shared by all accounts.
+        data["claudeAiOauth"] = target_data["claudeAiOauth"]
+        write_live(data)
+    set_active(target)
+    save_profile(target, data)
+    if backup:
+        print(f"Preserved the previous credentials file: {backup}")
+    print(f"Active account: {profile_label(target)}. "
+          "OpenCode picks it up within about 30 seconds.")
+
+
+def manage_accounts(action, name=None):
+    """Registry changes share the credential lock with scheduled and manual work."""
+    if action == "list":
+        names = profiles()
+        for candidate in names:
+            status = "registered" if credential_path(candidate).exists() else "not authenticated"
+            print(f"{profile_label(candidate)}: {status}")
+        print(f"Window turns: {len(registered_profiles())} authenticated account(s), "
+              f"interval {prime_interval() / 60:g} min (5 h / N).")
+        return
+    # Validate before forming any file paths or writing state.
+    credential_path(name)
+    with tool_lock():
+        state = sync()
+        names = profiles()
+        if action == "add":
+            if credential_path(name).exists():
+                raise ValueError("This profile already has credentials. Use login to reauthenticate it.")
+            if name not in names:
+                save_profiles([*names, name])
+            # Keep the profile registered as pending if browser login is cancelled,
+            # so it can be retried. Pending profiles don't change the schedule.
+            login(name, state)
+        elif action == "remove":
+            if name not in names:
+                raise ValueError("Unknown profile: " + name)
+            if name == state["active"]:
+                raise ValueError("Cannot remove the active account. Switch to another account first.")
+            if state["status"] not in ("ok", "missing"):
+                raise ValueError("Reconcile the live credentials before removing an account.")
+            # Archive instead of deleting authentication; no bearer tokens are
+            # exposed in logs, and removed accounts no longer get scheduled.
+            archive = Path(tempfile.mkdtemp(prefix="removed-" + name + "-", dir=STORE))
+            for path in (credential_path(name), identity_path(name), usage_cache_path(name)):
+                if path.exists():
+                    path.replace(archive / path.name)
+            save_profiles([candidate for candidate in names if candidate != name])
+            print(f"Removed {name}. Private credentials archived at {archive}")
+        else:
+            raise ValueError("Unknown account action.")
+        print(f"Window interval: {prime_interval() / 60:g} min (5 h / N).")
+
+
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+USAGE_WINDOWS = (("five_hour", "5 h"), ("seven_day", "7 d"))
+UTF8 = (locale.getpreferredencoding(False) or "").lower().replace("-", "") == "utf8"
+GLYPHS = ({"full": "\u2588", "empty": "\u2591", "active": "\u25cf", "idle": "\u25cb"} if UTF8
+          else {"full": "#", "empty": ".", "active": "*", "idle": "-"})
+
+
+class UsageUnavailable(Exception):
+    """A quota lookup failed; the message is safe to display (never contains tokens)."""
+
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def usage_cache_path(name):
+    return STORE / (name + ".usage.json")
+
+
+def read_usage_cache(name):
+    """Last known usage and any server-requested cooldown. Contains no secrets."""
+    try:
+        cache = json.loads(usage_cache_path(name).read_text())
+        windows = {}
+        for key, value in cache.get("windows", {}).items():
+            reset = datetime.fromisoformat(value["resets"]) if value.get("resets") else None
+            windows[key] = {"used": max(0.0, min(100.0, float(value["used"]))), "resets": reset}
+        return {"windows": windows, "fetched_at": float(cache.get("fetched_at", 0)),
+                "retry_at": float(cache.get("retry_at", 0))}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return {"windows": {}, "fetched_at": 0.0, "retry_at": 0.0}
+
+
+def write_usage_cache(name, windows, fetched_at, retry_at=0.0):
+    serial = {key: {"used": value["used"],
+                    "resets": value["resets"].isoformat() if value["resets"] else None}
+              for key, value in windows.items()}
+    try:
+        write_json(usage_cache_path(name),
+                   {"windows": serial, "fetched_at": fetched_at, "retry_at": retry_at})
+    except OSError:
+        pass  # A cache is a display aid; failing to write it must not break lookups.
+
+
+def fetch_usage(token):
+    """Query the (undocumented) OAuth usage endpoint used by Claude Code."""
+    try:
+        payload = http_json(USAGE_URL, headers={
+            "Authorization": "Bearer " + token, "anthropic-beta": "oauth-2025-04-20"})
+    except urllib.error.HTTPError as error:
+        if error.code == 429:
+            try:
+                retry_after = max(30.0, float(error.headers.get("Retry-After", "")))
+            except (TypeError, ValueError):
+                retry_after = 300.0
+            raise UsageUnavailable("rate limited", retry_after) from None
+        reason = {401: "token rejected - log in again",
+                  403: "usage not available for this account"}
+        raise UsageUnavailable(reason.get(error.code, f"usage unavailable (HTTP {error.code})")) from None
+    except (OSError, ValueError):
+        raise UsageUnavailable("usage unavailable (network or response error)") from None
+    if not isinstance(payload, dict):
+        raise UsageUnavailable("usage unavailable (unexpected response)")
+    windows = {}
+    for key, _ in USAGE_WINDOWS:
+        window = payload.get(key)
+        used = window.get("utilization") if isinstance(window, dict) else None
+        if type(used) not in (int, float) or not math.isfinite(used):
+            continue
+        reset = None
+        if isinstance(window.get("resets_at"), str):
+            try:
+                reset = datetime.fromisoformat(window["resets_at"])
+            except ValueError:
+                pass
+        windows[key] = {"used": max(0.0, min(100.0, float(used))), "resets": reset}
+        if window.get("utilization") == 0 and "resets_at" in window and window["resets_at"] is None:
+            windows[key]["idle"] = True
+    if not windows:
+        raise UsageUnavailable("usage unavailable (no quota windows reported)")
+    return windows
+
+
+def clock(timestamp):
+    moment = datetime.fromtimestamp(timestamp).astimezone()
+    if moment.date() == datetime.now().astimezone().date():
+        return moment.strftime("%H:%M")
+    return moment.strftime("%a %H:%M")
+
+
+def cached_result(cache, reason, retry_at=None):
+    """Prefer last known usage over an error message when a lookup is refused."""
+    if cache["windows"]:
+        return {"state": "ok", "windows": cache["windows"], "cached_at": cache["fetched_at"],
+                "retry_at": retry_at}
+    if retry_at:
+        return {"state": f"rate limited - retry after {clock(retry_at)}"}
+    return {"state": reason}
+
+
+def usage_note(result):
+    parts = []
+    if result.get("cached_at"):
+        parts.append("cached " + clock(result["cached_at"]))
+    if result.get("retry_at"):
+        parts.append("retry " + clock(result["retry_at"]))
+    return ", ".join(parts)
+
+
+USAGE_FRESH_SECONDS = 60
+
+# A lightweight timer checks due turns each minute. Actual prompt turns divide
+# a five-hour window evenly among registered accounts; missed turns aren't replayed.
+WINDOW_SECONDS = 5 * 60 * 60
+
+
+def prime_interval():
+    return WINDOW_SECONDS / max(1, len(registered_profiles()))
+
+
+def prime_state_path():
+    return STORE / "window-schedule.json"
+
+
+def run_minimal_prompt(token):
+    """Use one account without swapping ~/.claude or exposing its token in argv."""
+    executable = shutil.which("claude")
+    if not executable:
+        candidate = HOME / ".local/bin/claude"
+        if candidate.is_file():
+            executable = str(candidate)
+    if not executable:
+        raise ValueError("Claude CLI not found; cannot open a usage window.")
+    with tempfile.TemporaryDirectory(prefix=".window-", dir=STORE) as tmp:
+        env = dict(os.environ, CLAUDE_CONFIG_DIR=tmp, CLAUDE_CODE_OAUTH_TOKEN=token)
+        for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+                    "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+                    "CLAUDE_CODE_USE_FOUNDRY"):
+            env.pop(key, None)
+        try:
+            result = subprocess.run(
+                [executable, "--safe-mode", "--print", "--model", "haiku",
+                 "--effort", "low", "--tools", "", "--no-session-persistence",
+                 "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+                 "--system-prompt", "Reply with OK only.", "--output-format", "json",
+                 "Reply with OK only."],
+                cwd=tmp, env=env, stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, timeout=90,
+            )
+        except subprocess.TimeoutExpired:
+            raise ValueError("Window prompt timed out; no automatic retry will be sent.") from None
+        # Never copy subprocess diagnostics into logs: they may contain auth details.
+        if result.returncode:
+            raise ValueError(f"Window prompt failed (CLI exit {result.returncode}).")
+        try:
+            payload = json.loads(result.stdout)
+        except ValueError:
+            raise ValueError("Window prompt returned an unexpected response.") from None
+        if not isinstance(payload, dict) or payload.get("is_error") or payload.get("subtype") != "success":
+            raise ValueError("Window prompt did not report success.")
+
+
+def prime_profile(name, state):
+    """Open a window only when its live reset timestamp says no window is open."""
+    path = credential_path(name)
+    if not path.exists():
+        return "skipped: account not registered"
+    if state["status"] != "ok":
+        return "skipped: reconcile credentials first"
+    is_active = name == state["active"]
+    data = load(LIVE if is_active else path)
+    if expiring(data):
+        if is_active:
+            data, _ = refresh_live()
+            save_profile(name, data)
+        else:
+            data = freshen(path)
+    cache = read_usage_cache(name)
+    if cache["retry_at"] > time.time():
+        return "skipped: usage endpoint is rate limited"
+
+    def lookup():
+        try:
+            windows = fetch_usage(data["claudeAiOauth"]["accessToken"])
+        except UsageUnavailable as error:
+            if error.retry_after:
+                write_usage_cache(name, cache["windows"], cache["fetched_at"],
+                                  time.time() + error.retry_after)
+            raise
+        write_usage_cache(name, windows, time.time())
+        return windows
+
+    try:
+        windows = lookup()
+    except UsageUnavailable:
+        return "skipped: could not verify the current usage window"
+    window = windows.get("five_hour")
+    if not window or (window["resets"] is None and not window.get("idle")):
+        return "skipped: no usable five-hour reset timestamp"
+    if window["resets"] and window["resets"].timestamp() > time.time():
+        return "skipped: five-hour window already open (" + format_reset(window["resets"]) + ")"
+    weekly = windows.get("seven_day")
+    if weekly and weekly["used"] >= 100 and (
+            weekly["resets"] is None or weekly["resets"].timestamp() > time.time()):
+        return "skipped: weekly quota exhausted"
+    run_minimal_prompt(data["claudeAiOauth"]["accessToken"])
+    try:
+        after = lookup().get("five_hour")
+    except UsageUnavailable:
+        return "prompt sent; new reset time not yet verified"
+    if after and after["resets"] and after["resets"].timestamp() > time.time():
+        return f"window confirmed: {after['used']:.1f}% used, {format_reset(after['resets'])}"
+    return "prompt sent; endpoint has not confirmed a new window yet"
+
+
+def prime_next():
+    """One scheduled slot. Caller holds tool_lock(); no active account is switched."""
+    path = prime_state_path()
+    schedule = json.loads(path.read_text()) if path.exists() else {}
+    names = registered_profiles()
+    if not names:
+        return True
+    name = schedule.get("next", names[0])
+    if name not in names:
+        name = names[0]  # An inactive profile may have been removed since the last turn.
+    last = schedule.get("attempted_at", 0)
+    if type(last) not in (int, float) or not math.isfinite(last):
+        raise ValueError("Invalid window schedule state; no prompt was sent.")
+    # systemd measures from service activation, a few milliseconds before Python
+    # records attempted_at. Allow five seconds so that skew cannot skip a turn.
+    if last and time.time() < last + prime_interval() - 5:
+        return True
+    # Commit the slot BEFORE any network call. Crashes, failures and repeated
+    # service starts cannot produce a burst or retry a possibly sent prompt.
+    schedule.update(next=names[(names.index(name) + 1) % len(names)],
+                    attempted_at=time.time(), profile=name, result="started")
+    write_json(path, schedule)
+    try:
+        state = sync()
+        outcome = prime_profile(name, state)
+    except ERRORS as error:
+        outcome = str(error)
+        ok = False
+    else:
+        ok = True
+    schedule["result"] = outcome
+    write_json(path, schedule)
+    print(f"Window schedule - {display_name(name)}: {outcome}")
+    return ok
+
+
+def profile_usage(name, force=False):
+    """Return {"state": "ok", "windows": ...} or {"state": <displayable reason>}.
+
+    Successful lookups are cached. A server-requested cooldown (HTTP 429 with
+    Retry-After) is persisted and honoured, so the endpoint is not queried again
+    for that account until it expires; the last known usage is shown meanwhile.
+    """
+    path = credential_path(name)
+    if not path.exists():
+        return {"state": "not registered"}
+    cache = read_usage_cache(name)
+    if time.time() < cache["retry_at"]:
+        return cached_result(cache, "rate limited", cache["retry_at"])
+    if (not force and cache["windows"]
+            and time.time() - cache["fetched_at"] < USAGE_FRESH_SECONDS):
+        return {"state": "ok", "windows": cache["windows"]}
+    try:
+        current = active()
+    except ERRORS:
+        current = None
+    # The active account's live token is in ~/.claude (others may have renewed
+    # it since it was saved). Use it only once sync() has verified its owner.
+    is_active = name == current
+    if is_active and LAST_SYNC["status"] != "ok":
+        return {"state": "credentials need attention - see Diagnose authentication"}
+    try:
+        data = load(LIVE if is_active else path)
+        if expiring(data, 60_000):
+            if current is None:
+                return {"state": "token expired - renewal pending"}
+            with (STORE / ".lock").open("a") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return {"state": "busy - press r to retry"}
+                if active() != current:
+                    return {"state": "busy - press r to retry"}  # Switched meanwhile.
+                try:
+                    if is_active:
+                        data, _ = refresh_live()
+                        save_profile(name, data)
+                    else:
+                        data = freshen(path)
+                except ERRORS:
+                    return {"state": "token renewal failed - retry or log in again"}
+        windows = fetch_usage(data["claudeAiOauth"]["accessToken"])
+        write_usage_cache(name, windows, time.time())
+        return {"state": "ok", "windows": windows}
+    except UsageUnavailable as error:
+        if error.retry_after:
+            retry_at = time.time() + error.retry_after
+            write_usage_cache(name, cache["windows"], cache["fetched_at"], retry_at)
+            return cached_result(cache, str(error), retry_at)
+        return cached_result(cache, str(error))
+    except ERRORS:
+        return {"state": "credentials unavailable - run Diagnose authentication"}
+
+
+def collect_usage(force=False):
+    names = profiles()
+    if not names:
+        return {}
+    with ThreadPoolExecutor(max_workers=min(4, len(names))) as pool:
+        return dict(zip(names, pool.map(lambda name: profile_usage(name, force), names)))
+
+
+class UsageMonitor:
+    """Fetch usage in the background so the menu never waits on the network."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._results = {}
+        self._loading = False
+
+    def start(self, force=False):
+        with self._lock:
+            if self._loading:
+                return
+            self._loading = True
+        threading.Thread(target=self._run, args=(force,), daemon=True).start()
+
+    def _run(self, force=False):
+        try:
+            results = collect_usage(force)
+        except Exception:  # A display aid must never leave the menu stuck loading.
+            results = {name: {"state": "usage unavailable"} for name in profiles()}
+        with self._lock:
+            self._results = results
+            self._loading = False
+
+    def snapshot(self):
+        with self._lock:
+            return dict(self._results), self._loading
+
+
+def usage_bar(used, width):
+    filled = round(used / 100 * width)
+    return GLYPHS["full"] * filled + GLYPHS["empty"] * (width - filled)
+
+
+def usage_level(used):
+    return "high" if used >= 85 else "medium" if used >= 60 else "low"
+
+
+# Bars use a positional gradient: each cell is colored by where it sits along
+# the bar, from green through yellow and orange to red. A low reading stays
+# green; a high one shows the whole ramp. The percentage takes the color of
+# the point the bar reaches. Values are xterm 256-color cube entries.
+GRADIENT_256 = (77, 113, 149, 185, 221, 215, 209, 203)
+
+
+def gradient_step(fraction, steps=len(GRADIENT_256)):
+    return min(steps - 1, max(0, int(fraction * steps)))
+
+
+def cell_fraction(index, width):
+    return (index + 0.5) / width
+
+
+def ansi_colors():
+    """Color depth for plain-text output: 256, 8 or 0 (disabled)."""
+    if "NO_COLOR" in os.environ or not sys.stdout.isatty() \
+            or os.environ.get("TERM", "dumb") == "dumb":
+        return 0
+    term = os.environ.get("TERM", "") + os.environ.get("COLORTERM", "")
+    return 256 if any(s in term for s in ("256color", "truecolor", "24bit")) else 8
+
+
+def ansi_color(fraction, depth):
+    if depth == 256:
+        return f"\x1b[38;5;{GRADIENT_256[gradient_step(fraction)]}m"
+    return {"low": "\x1b[32m", "medium": "\x1b[33m", "high": "\x1b[31m"}[
+        usage_level(fraction * 100)]
+
+
+def ansi_bar(used, width, depth):
+    """Text bar for the usage command, with the same gradient as the menu."""
+    if not depth:
+        return usage_bar(used, width)
+    filled = round(used / 100 * width)
+    cells = "".join(ansi_color(cell_fraction(i, width), depth) + GLYPHS["full"]
+                    for i in range(filled))
+    return cells + "\x1b[2m" + GLYPHS["empty"] * (width - filled) + "\x1b[0m"
+
+
+def format_reset(moment):
+    if moment is None:
+        return ""
+    local = moment.astimezone()
+    if local <= datetime.now().astimezone():
+        return "window reset since"  # Cached figure predates the reset.
+    if local.date() == datetime.now().astimezone().date():
+        return "resets " + local.strftime("%H:%M")
+    return "resets " + local.strftime("%a %H:%M")
+
+
+def account_overview():
+    try:
+        current = active()
+        problem = SYNC_PROBLEMS.get(LAST_SYNC["status"])
+    except ERRORS:
+        current, problem = None, "credentials need attention"
+    rows = []
+    for name in profiles():
+        try:
+            info = identity(name)
+        except ERRORS:
+            info = {}
+        rows.append({"name": name, "alias": safe_text(info.get("alias", name)),
+                     "email": safe_text(info.get("email", "identity pending")),
+                     "active": name == current})
+    return rows, problem
+
+
+SIGNATURE = "ng"
+LOGO = (
+    r"   ____ _                 _",
+    r"  / ___| | __ _ _   _  __| | ___",
+    r" | |   | |/ _` | | | |/ _` |/ _ \ ",
+    r" | |___| | (_| | |_| | (_| |  __/",
+    r"  \____|_|\__,_|\__,_|\__,_|\___|",
+)
+
+
+BOX = ({"tl": "\u256d", "tr": "\u256e", "bl": "\u2570", "br": "\u256f", "h": "\u2500", "v": "\u2502"}
+       if UTF8 else {"tl": "+", "tr": "+", "bl": "+", "br": "+", "h": "-", "v": "|"})
+
+
+def select(title, options, details=(), initial=0, error=False, dashboard=False, usage=None,
+           groups=None):
+    """Return an option index, restoring terminal state even on cancellation."""
+    def draw(screen):
+        screen.keypad(True)
+        curses.set_escdelay(35)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        accent = curses.A_BOLD
+        highlight = curses.A_REVERSE | curses.A_BOLD
+        muted = curses.A_DIM
+        active_style = curses.A_BOLD
+        if curses.has_colors() and "NO_COLOR" not in os.environ:
+            curses.start_color()
+            background = curses.COLOR_BLACK
+            try:
+                curses.use_default_colors()
+                background = -1
+            except curses.error:
+                pass
+            terracotta = 173 if curses.COLORS >= 256 else curses.COLOR_YELLOW
+            curses.init_pair(1, curses.COLOR_RED if error else terracotta, background)
+            curses.init_pair(2, curses.COLOR_BLACK, terracotta)
+            curses.init_pair(3, curses.COLOR_GREEN, background)
+            curses.init_pair(4, terracotta, background)
+            curses.init_pair(5, curses.COLOR_RED, background)
+            accent |= curses.color_pair(1)
+            highlight = curses.color_pair(2) | curses.A_BOLD
+            active_style |= curses.color_pair(3)
+            levels = {"low": curses.color_pair(3), "medium": curses.color_pair(4),
+                      "high": curses.color_pair(5) | curses.A_BOLD}
+            ramp = []
+            if curses.COLORS >= 256 and curses.COLOR_PAIRS > 10 + len(GRADIENT_256):
+                for offset, color in enumerate(GRADIENT_256):
+                    curses.init_pair(10 + offset, color, background)
+                    ramp.append(curses.color_pair(10 + offset))
+        else:
+            levels = {"low": 0, "medium": 0, "high": curses.A_BOLD}
+            ramp = []
+
+        def color_at(fraction):
+            # Smooth ramp on 256-color terminals; green/yellow/red otherwise.
+            if ramp:
+                return ramp[gradient_step(fraction, len(ramp))]
+            return levels[usage_level(fraction * 100)]
+        # curses reuses stdscr across wrappers: explicitly reset the timeout in
+        # submenus rather than inheriting the dashboard's polling interval.
+        screen.timeout(250 if usage is not None else -1)
+
+        selected = min(initial, len(options) - 1)
+        account_page = 0
+        account_pages = 1
+        while True:
+            screen.erase()
+            height, width = screen.getmaxyx()
+
+            def put(y, text, style=0, x=2):
+                if 0 <= y < height and width > x + 2:
+                    try:
+                        screen.addnstr(y, x, text, width - x - 2, style)
+                    except curses.error:
+                        pass
+
+            def put_bar(y, x, used, bar_width):
+                filled = round(used / 100 * bar_width)
+                for cell in range(filled):
+                    put(y, GLYPHS["full"], color_at(cell_fraction(cell, bar_width)), x=x + cell)
+                put(y, GLYPHS["empty"] * (bar_width - filled), muted, x=x + filled)
+
+            def put_header():
+                header = "CLAUDE ACCOUNT SWITCHER"
+                put(1, header, accent)
+                put(1, SIGNATURE, accent, x=2 + len(header) + 2)
+
+            minimum_height = len(options) + 8 if dashboard else 10
+            if height < minimum_height or width < 36:
+                put(0, "Enlarge terminal (36 columns min).", accent)
+                put(1, "Esc / q: back", muted)
+            else:
+                full = False
+                grouped = False
+                if dashboard:
+                    accounts, problem = account_overview()
+                    full = height >= max(32, len(options) + len(groups or {}) + 13
+                                         + 4 * len(accounts)) and width >= 60
+                    grouped = full or height >= len(options) + len(accounts) + 9
+                    results, loading = usage.snapshot() if usage else ({}, False)
+                    if full:
+                        for row, line in enumerate(LOGO, 1):
+                            put(row, line, accent)
+                        subtitle = "     A C C O U N T   S W I T C H E R"
+                        put(7, subtitle, curses.A_BOLD)
+                        # Signature sits right-aligned under the subtitle, as designed.
+                        put(8, SIGNATURE, accent, x=2 + len(subtitle) - len(SIGNATURE))
+                        card = min(width - 4, 72)
+                        inner = card - 4
+                        label = " ACCOUNTS " + ("- " + problem + " " if problem else "")
+                        label += "- loading usage " if loading else ""
+                        put(9, BOX["tl"] + BOX["h"] + label + BOX["h"] * (card - len(label) - 3)
+                            + BOX["tr"], muted)
+                        row = 10
+                        for index, account in enumerate(accounts):
+                            if index:
+                                put(row, BOX["v"] + " " * (card - 2) + BOX["v"], muted)
+                                row += 1
+                            mark = GLYPHS["active"] if account["active"] else GLYPHS["idle"]
+                            result = results.get(account["name"])
+                            note = usage_note(result) if result else ""
+                            tag = "  ".join(filter(None, [note, "ACTIVE" if account["active"] else ""]))
+                            head = f"{mark} {account['alias']}   {account['email']}"
+                            head = head[:max(0, inner - len(tag) - 1)].ljust(inner - len(tag))
+                            put(row, BOX["v"] + " " + " " * inner + " " + BOX["v"], muted)
+                            put(row, head, active_style if account["active"] else curses.A_BOLD, x=4)
+                            if note:
+                                put(row, note, muted, x=4 + inner - len(tag))
+                            if account["active"]:
+                                put(row, "ACTIVE", active_style, x=4 + inner - 6)
+                            row += 1
+                            windows = result.get("windows", {}) if result else {}
+                            for line_index, (key, short) in enumerate(USAGE_WINDOWS):
+                                put(row, BOX["v"] + " " * (card - 2) + BOX["v"], muted)
+                                window = windows.get(key)
+                                if window:
+                                    used = window["used"]
+                                    percent = f"  {used:3.0f} %"
+                                    tail = f"  {format_reset(window['resets'])}"
+                                    # 26 columns: "  100 %  resets Wed 17:00" plus margin.
+                                    bar_width = max(8, inner - 7 - 26)
+                                    room = inner - 7 - bar_width
+                                    put(row, f"  {short}  ", muted, x=4)
+                                    put_bar(row, 11, used, bar_width)
+                                    put(row, percent[:room], color_at(used / 100),
+                                        x=11 + bar_width)
+                                    put(row, tail[:max(0, room - len(percent))], muted,
+                                        x=11 + bar_width + len(percent))
+                                elif line_index == 0:
+                                    message = ("loading usage..." if loading or result is None
+                                               else result["state"])
+                                    put(row, ("  " + message)[:inner], muted, x=4)
+                                row += 1
+                        put(row, BOX["bl"] + BOX["h"] * (card - 2) + BOX["br"], muted)
+                        start = row + 2
+                    else:
+                        put_header()
+                        row = 3
+                        bar_width = max(4, (width - 4 - 34) // 2)
+                        capacity = max(1, height - len(options) - 6)
+                        account_pages = max(1, math.ceil(len(accounts) / capacity))
+                        account_page %= account_pages
+                        first = account_page * capacity
+                        visible_accounts = accounts[first:first + capacity]
+                        if account_pages > 1:
+                            put(2, f"Accounts {first + 1}-{first + len(visible_accounts)}/{len(accounts)}"
+                                "  [ / ] pages", muted)
+                        for account in visible_accounts:
+                            mark = GLYPHS["active"] if account["active"] else GLYPHS["idle"]
+                            put(row, f"{mark} {account['alias'][:10]}",
+                                active_style if account["active"] else curses.A_BOLD)
+                            result = results.get(account["name"])
+                            windows = result.get("windows", {}) if result else {}
+                            x = 15
+                            if windows:
+                                for key, short in USAGE_WINDOWS:
+                                    window = windows.get(key)
+                                    if not window:
+                                        continue
+                                    used = window["used"]
+                                    put(row, short.replace(" ", ""), muted, x=x)
+                                    put_bar(row, x + 3, used, bar_width)
+                                    put(row, f"{used:3.0f}%", color_at(used / 100),
+                                        x=x + 4 + bar_width)
+                                    x += bar_width + 10
+                            else:
+                                message = "loading..." if loading or result is None else result["state"]
+                                put(row, message, muted, x=x)
+                            row += 1
+                        start = row + 1
+                else:
+                    put_header()
+                    put(3, title, curses.A_BOLD)
+                    available = height - min(len(options), 5) - 9
+                    lines = []
+                    for detail in details:
+                        lines.extend(textwrap.wrap(safe_text(detail), width - 4) or [""])
+                    visible = lines[:max(0, available)]
+                    if len(lines) > len(visible) and visible:
+                        visible[-1] = "... (enlarge terminal for more details)"
+                    for index, line in enumerate(visible):
+                        put(5 + index, line, muted)
+                    start = 6 + len(visible)
+                offset = 0
+                room = max(1, height - start - 3)
+                begin = max(0, selected - room + 1) if not dashboard else 0
+                end = min(len(options), begin + room) if not dashboard else len(options)
+                if not dashboard and (begin or end < len(options)):
+                    put(3, f"{title} [{selected + 1}/{len(options)}]", curses.A_BOLD)
+                for index in range(begin, end):
+                    label = options[index]
+                    if grouped and groups and index in groups:
+                        put(start + index + offset, groups[index], muted)
+                        offset += 1
+                    marker = "> " if index == selected else "  "
+                    put(start + index - begin + offset, (marker + label).ljust(width - 4),
+                        highlight if index == selected else 0)
+                last_row = start + end - begin - 1 + offset
+                if dashboard and details and last_row < height - 3:
+                    # Sync notices (for example, an adopted renewal) above the help line.
+                    put(height - 3, safe_text(details[0]), accent if problem else muted)
+                if usage is not None:
+                    help_text = ("Up/Down Move   Enter Select   r Refresh usage   Esc Back"
+                                 if width >= 62 else "Up/Down  Enter  r Refresh  Esc")
+                else:
+                    help_text = ("Up/Down Move   Enter Select   Esc Back"
+                                 if width >= 50 else "Up/Down  Enter  Esc")
+                put(height - 2, help_text, muted)
+            screen.refresh()
+            key = screen.getch()
+            if key == -1:
+                continue
+            if dashboard and key in (ord("["), ord("]")):
+                account_page = (account_page + (1 if key == ord("]") else -1)) % account_pages
+                continue
+            if usage is not None and key == ord("r"):
+                usage.start(force=True)
+                continue
+            if key in (27, ord("q")):
+                return None
+            if key == 3:
+                raise KeyboardInterrupt
+            if key in (curses.KEY_UP, ord("k"), curses.KEY_BTAB):
+                selected = (selected - 1) % len(options)
+            elif key in (curses.KEY_DOWN, ord("j"), 9):
+                selected = (selected + 1) % len(options)
+            elif key == curses.KEY_HOME:
+                selected = 0
+            elif key == curses.KEY_END:
+                selected = len(options) - 1
+            elif key == curses.KEY_NPAGE:
+                selected = min(len(options) - 1, selected + max(1, height // 2))
+            elif key == curses.KEY_PPAGE:
+                selected = max(0, selected - max(1, height // 2))
+            elif key in (10, 13, curses.KEY_ENTER):
+                if height >= minimum_height and width >= 36:
+                    return selected
+
+    return curses.wrapper(draw)
+
+
+def choose_profile(action):
+    try:
+        current = active()
+    except ERRORS:
+        if action not in ("repair", "alias"):
+            raise
+        current = None
+    choices = profiles()
+    labels = []
+    for name in choices:
+        state = "active" if name == current else "saved" if credential_path(name).exists() else "not registered"
+        labels.append(f"{profile_label(name)}  [{state}]")
+    verb = {"repair": "restore"}.get(action, action)
+    choice = select(f"Choose an account to {verb}", labels + ["Back"],
+                    [f"Active account: {display_name(current) if current else 'none'}"])
+    return choices[choice] if choice is not None and choice < len(choices) else None
+
+
+def edit_text(title, initial=""):
+    def draw(screen):
+        screen.keypad(True)
+        # get_wch raises curses.error on a timeout, unlike getch which returns -1.
+        # Editing must wait indefinitely for typing, including pauses.
+        screen.timeout(-1)
+        curses.set_escdelay(35)
+        value = initial
+        while True:
+            screen.erase()
+            height, width = screen.getmaxyx()
+            for row, line in enumerate((title, "", value,
+                                        "", "Enter: save   Esc: cancel   Backspace: delete")):
+                if row < height - 1 and width > 1:
+                    try:
+                        screen.addnstr(row, 0, safe_text(line), width - 1,
+                                       curses.A_REVERSE if row == 2 else 0)
+                    except curses.error:
+                        pass  # Terminal resized during drawing; redraw on KEY_RESIZE.
+            screen.refresh()
+            key = screen.get_wch()
+            if key == "\x1b":
+                return None
+            if key in ("\n", "\r", curses.KEY_ENTER):
+                if value.strip():
+                    return value.strip()
+            elif key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                value = value[:-1]
+            elif isinstance(key, str) and key.isprintable() and len(value) < 48:
+                value += key
+    return curses.wrapper(draw)
+
+
+def edit_alias(profile):
+    return edit_text(f"Alias for {profile}", identity(profile).get("alias", profile))
+
+
+def accounts_menu():
+    while True:
+        choice = select("Manage accounts", ["Add account", "Remove account",
+                                           "Register current credentials", "Back"],
+                        [f"{len(registered_profiles())} authenticated account(s)",
+                         f"Window turn interval: {prime_interval() / 60:g} min (5 h / N)"])
+        if choice is None or choice == 3:
+            return
+        try:
+            if choice == 0:
+                name = edit_text("New profile name (lowercase letters, digits, _ or -)")
+                if name is None:
+                    continue
+                manage_accounts("add", name)
+                select("Account added", ["Back"], [profile_label(name)])
+            elif choice == 1:
+                name = choose_profile("remove")
+                if name is None:
+                    continue
+                if select("Remove this profile?", ["Cancel", "Remove"],
+                          [profile_label(name), "Its credentials will be archived privately."]) != 1:
+                    continue
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    manage_accounts("remove", name)
+                select("Account removed", ["Back"], output.getvalue().splitlines())
+            else:
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    execute("init")
+                select("Current credentials", ["Back"], output.getvalue().splitlines())
+        except ERRORS as error:
+            select("Action failed", ["Back"], [str(error)], error=True)
+
+
+TIMERS = {"windows": "ng-claude-account-window.timer",
+          "renewal": "ng-claude-account-renew.timer"}
+TIMER_LABELS = {"windows": "Usage windows (5 h / N accounts)",
+                "renewal": "Token renewal (daily)"}
+
+
+def systemctl(*args):
+    """Control the user manager without invoking a shell or printing credentials."""
+    try:
+        result = subprocess.run(["systemctl", "--user", *args], capture_output=True,
+                                text=True, timeout=15)
+    except FileNotFoundError:
+        raise ValueError("systemctl is not installed; automation requires user systemd.") from None
+    except subprocess.TimeoutExpired:
+        raise ValueError("The user systemd manager did not respond within 15 seconds.") from None
+    if result.returncode:
+        raise ValueError("User systemd command failed: " + safe_text(result.stderr.strip())[:400]
+                         + ". Check that a user systemd manager is running.")
+    return result.stdout.strip()
+
+
+def timer_status(kind):
+    unit = TIMERS[kind]
+    properties = systemctl("show", unit, "-p", "LoadState", "-p", "ActiveState",
+                           "-p", "UnitFileState")
+    values = dict(line.split("=", 1) for line in properties.splitlines() if "=" in line)
+    if values.get("LoadState") == "not-found":
+        return [TIMER_LABELS[kind], "Timer not installed; apply its units with chezmoi."]
+    lines = [TIMER_LABELS[kind],
+             f"Timer: {values.get('ActiveState', 'unknown')} | "
+             f"Startup: {values.get('UnitFileState', 'unknown')}"]
+    if kind == "windows":
+        lines.append(f"Turn interval: {prime_interval() / 60:g} min; timer checks due turns each minute.")
+        if prime_state_path().exists():
+            schedule = json.loads(prime_state_path().read_text())
+            names = registered_profiles()
+            if names:
+                next_name = schedule.get("next") if schedule.get("next") in names else names[0]
+                lines.append(f"Next account turn: {display_name(next_name)}, not before "
+                             f"{clock(schedule['attempted_at'] + prime_interval())}")
+    listing = systemctl("list-timers", "--all", "--no-pager", "--no-legend", unit)
+    if listing:
+        # Keep systemd's timezone and monotonic next-run calculation intact.
+        heading = "Next timer check" if kind == "windows" else "Next run"
+        lines.extend([heading + " / remaining / last / elapsed:", listing.splitlines()[0]])
+    lines.append("The oneshot service normally stays inactive between timer runs.")
+    return lines
+
+
+def schedule_control(action, kind="windows"):
+    kinds = list(TIMERS) if kind == "all" else [kind]
+    for item in kinds:
+        unit = TIMERS[item]
+        if action == "enable":
+            systemctl("daemon-reload")
+            systemctl("enable", "--now", unit)
+        elif action == "disable":
+            systemctl("disable", "--now", unit)
+        for line in timer_status(item):
+            print(line)
+        if action == "disable":
+            print("Future turns are disabled; an already running turn may still finish.")
+
+
+def automation_menu():
+    while True:
+        choice = select("Automation", [TIMER_LABELS[k] for k in TIMERS] + ["Back"])
+        if choice is None or choice == len(TIMERS):
+            return
+        kind = list(TIMERS)[choice]
+        while True:
+            try:
+                details = timer_status(kind)
+            except ERRORS as error:
+                select("Automation unavailable", ["Back"], [str(error)], error=True)
+                break
+            action = select("Manage automation", ["Refresh status", "Enable", "Disable", "Back"],
+                            details)
+            if action is None or action == 3:
+                break
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    schedule_control(("status", "enable", "disable")[action], kind)
+            except ERRORS as error:
+                select("Action failed", ["Back"], [str(error)], error=True)
+
+
+MENU = (("Switch account", "switch"), ("Account details", "status"),
+        ("Renew expired tokens", "renew-all"), ("Log in / re-authenticate", "login"),
+        ("Edit alias", "alias"), ("Diagnose authentication", "doctor"),
+        ("Restore an account", "repair"), ("Manage accounts", "accounts-menu"),
+        ("Automation", "automation"), ("Exit", None))
+MENU_GROUPS = {4: "-- Manage --", 9: ""}
+
+
+def startup_sync():
+    """Reconcile before the dashboard opens; returns notices to display."""
+    if not (LIVE.exists() or LIVE.is_symlink() or STORE.exists()):
+        return []  # Nothing installed yet: do not create any state.
+    try:
+        with tool_lock():
+            return sync()["notes"]
+    except ERRORS as error:
+        return [str(error)]
+
+
+def menu():
+    selected = 0
+    options = [label for label, _ in MENU]
+    notices = startup_sync()
+    usage = UsageMonitor()
+    usage.start()
+    while True:
+        choice = select("Your accounts", options, notices, initial=selected, dashboard=True,
+                        usage=usage, groups=MENU_GROUPS)
+        if choice is None or MENU[choice][1] is None:
+            return
+        selected = choice
+        try:
+            command = MENU[choice][1]
+            if command == "automation":
+                automation_menu()
+                continue
+            if command == "accounts-menu":
+                accounts_menu()
+                usage.start(force=True)
+                continue
+            profile = None
+            alias = None
+            if command in ("switch", "login", "repair", "alias"):
+                profile = choose_profile(command)
+                if profile is None:
+                    continue
+            if command == "alias":
+                alias = edit_alias(profile)
+                if alias is None:
+                    continue
+            if command == "repair":
+                confirm = select("Restore this account into ~/.claude?", ["Cancel", "Restore"],
+                                 [profile_label(profile),
+                                  "What ~/.claude holds now is saved to its own profile when it "
+                                  "belongs to it, or to a private backup otherwise."])
+                if confirm != 1:
+                    continue
+            if command == "login":
+                # The selector has restored the terminal for Claude's browser login.
+                execute(command, profile)
+                message = f"Authentication saved for {profile_label(profile)}."
+            else:
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    execute(command, profile, alias)
+                message = output.getvalue()
+            if command in ("switch", "login", "renew", "renew-all", "repair", "init"):
+                usage.start(force=True)  # Accounts or tokens may have changed.
+            select("Account status" if command == "status" else "Done", ["Back to menu"],
+                   message.splitlines())
+        except ERRORS as error:
+            select("Action failed", ["Back to menu"], [str(error)], error=True)
+        finally:
+            # Only an unresolved credential problem stays on the dashboard.
+            notices = (LAST_SYNC["notes"][-1:]
+                       if LAST_SYNC["status"] not in ("ok", "unsynced") else [])
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__, epilog="Run without arguments to open the interactive menu."
+    )
+    commands = parser.add_subparsers(dest="command")
+    commands.add_parser("menu", help="Open the interactive menu")
+    commands.add_parser("status", help="Reconcile credentials and show the active account")
+    commands.add_parser("init", help="Register existing credentials as principal")
+    renew_command = commands.add_parser(
+        "renew", help="Renew the active account's expired token (--all: every account)")
+    renew_command.add_argument(
+        "--all", action="store_true",
+        help="renew every registered account whose token is expired or expiring")
+    commands.add_parser("doctor", help="Diagnose local credentials offline without modifying them")
+    commands.add_parser("usage", help="Show 5-hour and 7-day quota usage for every account")
+    commands.add_parser("prime-next", help="Run one due alternating usage-window slot")
+    account_command = commands.add_parser("accounts", help="List, add or remove account profiles")
+    account_command.add_argument("action", choices=("list", "add", "remove"))
+    account_command.add_argument("name", nargs="?")
+    schedule_command = commands.add_parser("schedule", help="Control user systemd automation")
+    schedule_command.add_argument("action", choices=("status", "enable", "disable"))
+    schedule_command.add_argument("--timer", choices=(*TIMERS, "all"), default="windows",
+                                  help="timer to control (default: windows)")
+    repair_command = commands.add_parser(
+        "repair", help="Restore a saved account into ~/.claude, keeping what is there first")
+    repair_command.add_argument("profile", choices=profiles())
+    alias_command = commands.add_parser("alias", help="Set a display alias without moving credentials")
+    alias_command.add_argument("profile", choices=profiles())
+    alias_command.add_argument("name")
+    switch = commands.add_parser("switch", help="Toggle accounts or select one")
+    switch.add_argument("profile", nargs="?", choices=profiles())
+    login = commands.add_parser("login", help="Authenticate a profile and capture its identity")
+    login.add_argument("profile", choices=profiles())
+    args = parser.parse_args()
+    if args.command != "schedule":
+        check_environment()
+    if args.command in (None, "menu"):
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            parser.error("The menu requires a terminal. Use status, switch, login, or init in scripts.")
+        menu()
+    else:
+        if args.command == "accounts":
+            if (args.action == "list" and args.name is not None) or (
+                    args.action != "list" and args.name is None):
+                parser.error("Use accounts list, accounts add <name>, or accounts remove <name>.")
+            manage_accounts(args.action, args.name)
+            return
+        if args.command == "schedule":
+            schedule_control(args.action, args.timer)
+            return
+        command = "renew-all" if args.command == "renew" and args.all else args.command
+        result = execute(command, getattr(args, "profile", None), getattr(args, "name", None))
+        if command in ("doctor", "renew-all", "prime-next") and result is False:
+            sys.exit(1)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, EOFError):
+        print("\nCancelled.")
+        sys.exit(130)
+    except ERRORS + (curses.error,) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)

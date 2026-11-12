@@ -1,0 +1,11 @@
+[Unit]
+Description=Run a due Claude usage-window turn (Claude Account Switcher)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/ng-claude-account prime-next
+UMask=0077
+Nice=10
+TimeoutStartSec=5min

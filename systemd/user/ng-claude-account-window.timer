@@ -1,0 +1,10 @@
+[Unit]
+Description=Check due Claude usage-window turns (Claude Account Switcher, 5 hours / N accounts)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=60s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

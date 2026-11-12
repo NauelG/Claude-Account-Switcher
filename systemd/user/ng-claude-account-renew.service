@@ -1,0 +1,13 @@
+[Unit]
+Description=Renew expired Claude OAuth tokens (ng-claude-account)
+Documentation=https://github.com/NauelG/Claude-Account-Switcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/ng-claude-account renew --all
+# Credential files must stay owner-only.
+UMask=0077
+Nice=10
+TimeoutStartSec=5min

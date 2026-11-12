@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily renewal of expired Claude OAuth tokens (Claude Account Switcher)
+
+[Timer]
+# Each renewal restarts the ~28-day lifetime of an account's refresh token, so
+# a daily run keeps idle accounts signed in. Missed runs (machine powered off)
+# run at the next boot.
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

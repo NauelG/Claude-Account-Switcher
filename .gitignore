@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.venv/
+.coverage
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+.env
+.env.*
+*.log
+
+# Runtime authentication and local account state never belong in this repository.
+.credentials.json
+.claude/
+claude-account/
+*.identity.json
+*.usage.json
+displaced-*.json
+profiles.json
+window-schedule.json
+removed-*/
